@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
                              QTextEdit, QFileDialog, QMessageBox, QGroupBox,
                              QProgressBar, QListWidget, QListWidgetItem, QSplitter,
-                             QTabWidget, QFrame, QRadioButton, QButtonGroup)
+                             QTabWidget, QFrame, QRadioButton, QButtonGroup, QCheckBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QThreadPool, QRunnable, pyqtSlot
 from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap, QGuiApplication
 from pathlib import Path
@@ -14,6 +14,7 @@ from datetime import datetime
 from config.config import lower_config
 from security.hardware_key import hardware_key_generator
 from api.api_client import APIClient
+from api.websocket_client import DeviceWebSocketThread
 from metadata.meter_data import MeterDataManager, DataType, MeterData
 
 # 配置日志
@@ -79,6 +80,7 @@ class MeterDataListItem(QFrame):
     def __init__(self, meter_data: MeterData, parent=None):
         super().__init__(parent)
         self.meter_data = meter_data
+        self.uploaded = False  # 是否已上传
         self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
         self.init_ui()
 
@@ -86,6 +88,11 @@ class MeterDataListItem(QFrame):
         """初始化UI"""
         layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 5, 8, 5)
+
+        # 复选框
+        self.checkbox = QCheckBox()
+        self.checkbox.setChecked(True)  # 默认选中
+        layout.addWidget(self.checkbox, stretch=0)
 
         # 数据类型图标和名称
         type_label = QLabel()
@@ -134,6 +141,17 @@ class MeterDataListItem(QFrame):
         """设置状态"""
         self.status_label.setText(status)
         self.status_label.setStyleSheet(f"color: {color};")
+    
+    def set_uploaded(self, uploaded: bool = True):
+        """设置为已上传"""
+        self.uploaded = uploaded
+        if uploaded:
+            self.checkbox.setChecked(False)
+            # self.checkbox.setEnabled(False)
+    
+    def is_selected(self) -> bool:
+        """是否被选中"""
+        return self.checkbox.isChecked() and not self.uploaded
 
     def set_progress(self, value: int):
         """设置进度"""
@@ -150,6 +168,7 @@ class LowerComputerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.client = None
+        self.ws_thread = None  # WebSocket 长连接线程
         self.authenticated = False
         self.data_items = {}  # 文件路径 -> MeterDataListItem
         self.meter_data_manager = MeterDataManager(lower_config.cache_dir)
@@ -276,6 +295,16 @@ class LowerComputerWindow(QMainWindow):
 
         # 列表操作按钮
         list_btn_layout = QHBoxLayout()
+        
+        self.select_all_btn = QPushButton("全选")
+        self.select_all_btn.clicked.connect(self.select_all_data)
+        self.select_all_btn.setEnabled(False)
+        list_btn_layout.addWidget(self.select_all_btn)
+        
+        self.deselect_all_btn = QPushButton("全不选")
+        self.deselect_all_btn.clicked.connect(self.deselect_all_data)
+        self.deselect_all_btn.setEnabled(False)
+        list_btn_layout.addWidget(self.deselect_all_btn)
 
         self.remove_file_btn = QPushButton("移除选中")
         self.remove_file_btn.clicked.connect(self.remove_selected_data)
@@ -463,7 +492,24 @@ class LowerComputerWindow(QMainWindow):
 
             self.authenticated = True
             self.log(f"连接成功: {result.get('message')}")
-            self.statusBar().showMessage("已连接 ✓")
+            
+            # 建立 WebSocket 长连接
+            self.ws_thread = DeviceWebSocketThread(
+                server_url=server_url,
+                device_id=device_id,
+                hardware_key=hardware_key
+            )
+            
+            # 设置 WebSocket 回调
+            self.ws_thread.set_connected_callback(self.on_ws_connected)
+            self.ws_thread.set_disconnected_callback(self.on_ws_disconnected)
+            self.ws_thread.set_error_callback(self.on_ws_error)
+            
+            # 启动 WebSocket 线程
+            self.ws_thread.start()
+            self.log("正在建立 WebSocket 长连接...")
+            
+            self.statusBar().showMessage("已连接 ✓ (WebSocket)")
 
             # 启用上传功能
             self.add_excel_btn.setEnabled(True)
@@ -591,6 +637,22 @@ class LowerComputerWindow(QMainWindow):
                 self.update_data_count()
                 self.log("已清空数据列表")
 
+    def select_all_data(self):
+        """全选数据"""
+        for file_info in self.data_items.values():
+            widget = file_info['widget']
+            if not widget.uploaded:
+                widget.checkbox.setChecked(True)
+        self.log("已全选数据")
+    
+    def deselect_all_data(self):
+        """全不选数据"""
+        for file_info in self.data_items.values():
+            widget = file_info['widget']
+            if not widget.uploaded:
+                widget.checkbox.setChecked(False)
+        self.log("已全不选数据")
+    
     def update_data_count(self):
         """更新数据计数"""
         excel_count = sum(1 for item in self.data_items.values() if item['data'].is_excel)
@@ -601,9 +663,11 @@ class LowerComputerWindow(QMainWindow):
 
         total = excel_count + image_count
         self.upload_btn.setEnabled(total > 0 and self.authenticated)
+        self.select_all_btn.setEnabled(total > 0)
+        self.deselect_all_btn.setEnabled(total > 0)
 
     def upload_data(self):
-        """上传所有数据"""
+        """上传选中的数据"""
         if not self.authenticated:
             QMessageBox.warning(self, "警告", "请先连接服务器")
             return
@@ -612,21 +676,31 @@ class LowerComputerWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请先添加要上传的数据")
             return
 
+        # 获取选中的数据
+        selected_items = [
+            file_info for file_info in self.data_items.values()
+            if file_info['widget'].is_selected()
+        ]
+        
+        if not selected_items:
+            QMessageBox.warning(self, "警告", "请选择要上传的数据")
+            return
+
         # 禁用按钮
         self.upload_btn.setEnabled(False)
         self.stop_upload_btn.setEnabled(True)
         self.add_excel_btn.setEnabled(False)
         self.add_image_btn.setEnabled(False)
 
-        self.log(f"开始上传 {len(self.data_items)} 个数据...")
+        self.log(f"开始上传 {len(selected_items)} 个数据...")
 
-        excel_count = sum(1 for item in self.data_items.values() if item['data'].is_excel)
-        image_count = len(self.data_items) - excel_count
+        excel_count = sum(1 for item in selected_items if item['data'].is_excel)
+        image_count = len(selected_items) - excel_count
         self.log(f"  - 电量数据: {excel_count} 个")
         self.log(f"  - 几何量数据: {image_count} 个")
 
-        # 创建上传任务
-        for file_info in self.data_items.values():
+        # 创建上传任务（仅上传选中的）
+        for file_info in selected_items:
             data_widget = file_info['widget']
             meter_data = file_info['data']
 
@@ -679,6 +753,7 @@ class LowerComputerWindow(QMainWindow):
                 if success:
                     file_info['widget'].set_status("✓ 成功", "green")
                     file_info['widget'].set_progress(100)
+                    file_info['widget'].set_uploaded(True)  # 标记为已上传，取消勾选
 
                     self.log(f"✓ {file_name}: {message}")
                 else:
@@ -796,18 +871,45 @@ class LowerComputerWindow(QMainWindow):
                 event.ignore()
                 return
 
+        # 关闭 WebSocket 连接
+        if self.ws_thread:
+            self.log("正在断开 WebSocket 连接...")
+            self.ws_thread.stop()
+            self.ws_thread.join(timeout=3)
+
         self.thread_pool.waitForDone(3000)
         event.accept()
+    
+    def on_ws_connected(self):
+        """WebSocket 连接成功回调"""
+        self.log("[WebSocket] 长连接已建立")
+    
+    def on_ws_disconnected(self):
+        """WebSocket 断开连接回调"""
+        self.log("[WebSocket] 连接已断开", error=True)
+    
+    def on_ws_error(self, error: str):
+        """WebSocket 错误回调"""
+        self.log(f"[WebSocket] 错误: {error}", error=True)
 
 def quit_qt_application(window:LowerComputerWindow):
     # 设备已登录
     if window.authenticated:
-        client: APIClient =window.client
-        device_id = window.device_id_input.text().strip()
-        hardware_key = lower_config.hardware_key
-        client.set_device_offline(device_id=device_id,hardware_key=hardware_key)
-        #设置离线：
-        pass
+        # 关闭 WebSocket 连接（WebSocket 断开时服务端会自动将设备设为离线）
+        if window.ws_thread:
+            logger.info("关闭 WebSocket 连接...")
+            window.ws_thread.stop()
+            window.ws_thread.join(timeout=3)
+        
+        # 额外调用 API 设置离线（双重保险）
+        try:
+            client: APIClient = window.client
+            device_id = window.device_id_input.text().strip()
+            hardware_key = lower_config.hardware_key
+            client.set_device_offline(device_id=device_id, hardware_key=hardware_key)
+            logger.info("设备已设置为离线")
+        except Exception as e:
+            logger.error(f"设置设备离线失败: {e}")
     pass
 def main():
     app = QApplication(sys.argv)
