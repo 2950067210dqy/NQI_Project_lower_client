@@ -15,6 +15,7 @@ from config.config import lower_config
 from security.hardware_key import hardware_key_generator
 from api.api_client import APIClient
 from api.websocket_client import DeviceWebSocketThread
+from api.long_polling_client import LowerLongPollingThread
 from metadata.meter_data import MeterDataManager, DataType, MeterData
 
 # 配置日志
@@ -168,7 +169,9 @@ class LowerComputerWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.client = None
-        self.ws_thread = None  # WebSocket 长连接线程
+        self.ws_thread = None  # WebSocket 长连接线程（向后兼容）
+        self.long_polling_thread = None  # HTTP长轮询心跳线程
+        self.connection_mode = 'long_polling'  # 连接模式：'websocket' 或 'long_polling'
         self.authenticated = False
         self.data_items = {}  # 文件路径 -> MeterDataListItem
         self.meter_data_manager = MeterDataManager(lower_config.cache_dir)
@@ -493,23 +496,39 @@ class LowerComputerWindow(QMainWindow):
             self.authenticated = True
             self.log(f"连接成功: {result.get('message')}")
             
-            # 建立 WebSocket 长连接
-            self.ws_thread = DeviceWebSocketThread(
-                server_url=server_url,
-                device_id=device_id,
-                hardware_key=hardware_key
-            )
-            
-            # 设置 WebSocket 回调
-            self.ws_thread.set_connected_callback(self.on_ws_connected)
-            self.ws_thread.set_disconnected_callback(self.on_ws_disconnected)
-            self.ws_thread.set_error_callback(self.on_ws_error)
-            
-            # 启动 WebSocket 线程
-            self.ws_thread.start()
-            self.log("正在建立 WebSocket 长连接...")
-            
-            self.statusBar().showMessage("已连接 ✓ (WebSocket)")
+            # 根据模式选择连接方式
+            if self.connection_mode == 'long_polling':
+                # 使用HTTP长轮询心跳
+                self.long_polling_thread = LowerLongPollingThread(
+                    server_url=server_url,
+                    device_id=device_id,
+                    hardware_key=hardware_key
+                )
+                
+                # 启动心跳线程
+                self.long_polling_thread.start()
+                self.log("正在启动HTTP心跳保活...")
+                
+                self.statusBar().showMessage("已连接 ✓ (HTTP长轮询)")
+                
+            else:
+                # 使用WebSocket（向后兼容）
+                self.ws_thread = DeviceWebSocketThread(
+                    server_url=server_url,
+                    device_id=device_id,
+                    hardware_key=hardware_key
+                )
+                
+                # 设置 WebSocket 回调
+                self.ws_thread.set_connected_callback(self.on_connected)
+                self.ws_thread.set_disconnected_callback(self.on_disconnected)
+                self.ws_thread.set_error_callback(self.on_error)
+                
+                # 启动 WebSocket 线程
+                self.ws_thread.start()
+                self.log("正在建立 WebSocket 长连接...")
+                
+                self.statusBar().showMessage("已连接 ✓ (WebSocket)")
 
             # 启用上传功能
             self.add_excel_btn.setEnabled(True)
@@ -871,46 +890,56 @@ class LowerComputerWindow(QMainWindow):
                 event.ignore()
                 return
 
-        # 关闭 WebSocket 连接
+        # 关闭连接
         if self.ws_thread:
             self.log("正在断开 WebSocket 连接...")
             self.ws_thread.stop()
             self.ws_thread.join(timeout=3)
+        
+        if self.long_polling_thread:
+            self.log("正在停止HTTP心跳...")
+            self.long_polling_thread.stop()
+            self.long_polling_thread.join(timeout=3)
 
         self.thread_pool.waitForDone(3000)
         event.accept()
     
-    def on_ws_connected(self):
-        """WebSocket 连接成功回调"""
-        self.log("[WebSocket] 长连接已建立")
+    def on_connected(self):
+        """连接成功回调"""
+        self.log("[连接] 长连接已建立")
     
-    def on_ws_disconnected(self):
-        """WebSocket 断开连接回调"""
-        self.log("[WebSocket] 连接已断开", error=True)
+    def on_disconnected(self):
+        """断开连接回调"""
+        self.log("[连接] 连接已断开", error=True)
     
-    def on_ws_error(self, error: str):
-        """WebSocket 错误回调"""
-        self.log(f"[WebSocket] 错误: {error}", error=True)
+    def on_error(self, error: str):
+        """错误回调"""
+        self.log(f"[连接] 错误: {error}", error=True)
 
 def quit_qt_application(window:LowerComputerWindow):
-    # 设备已登录
+    """退出应用程序"""
     if window.authenticated:
-        # 关闭 WebSocket 连接（WebSocket 断开时服务端会自动将设备设为离线）
+        # 关闭 WebSocket 连接
         if window.ws_thread:
             logger.info("关闭 WebSocket 连接...")
             window.ws_thread.stop()
             window.ws_thread.join(timeout=3)
         
+        # 停止HTTP心跳（心跳停止时会自动发送离线通知）
+        if window.long_polling_thread:
+            logger.info("停止HTTP心跳...")
+            window.long_polling_thread.stop()
+            window.long_polling_thread.join(timeout=3)
+        
         # 额外调用 API 设置离线（双重保险）
         try:
-            client: APIClient = window.client
-            device_id = window.device_id_input.text().strip()
-            hardware_key = lower_config.hardware_key
-            client.set_device_offline(device_id=device_id, hardware_key=hardware_key)
-            logger.info("设备已设置为离线")
+            if window.client:
+                device_id = window.device_id_input.text().strip()
+                hardware_key = lower_config.hardware_key
+                window.client.set_device_offline(device_id=device_id, hardware_key=hardware_key)
+                logger.info("设备已设置为离线")
         except Exception as e:
             logger.error(f"设置设备离线失败: {e}")
-    pass
 def main():
     app = QApplication(sys.argv)
 
