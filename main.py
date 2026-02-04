@@ -184,22 +184,36 @@ class LowerComputerWindow(QMainWindow):
         """初始化界面"""
         self.setWindowTitle("三相表数据上传系统")
         self.setGeometry(100, 100, 1000, 750)
-
+        self.setWindowIcon(QIcon(lower_config.ui_NQI_path))
         # 中央部件
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
 
         # 主布局
         main_layout = QVBoxLayout(central_widget)
+        top_layout = QHBoxLayout()
 
+        # NQI图片标识
+        nqi_image = QLabel()
+        nqi_image.setPixmap(QPixmap(lower_config.ui_NQI_path))
+        nqi_image.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        top_layout.addWidget(nqi_image)
         # 标题
         title_label = QLabel("三相表电量及几何量数据上传系统")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_font = QFont()
         title_font.setPointSize(16)
         title_font.setBold(True)
         title_label.setFont(title_font)
         title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        main_layout.addWidget(title_label)
+        top_layout.addWidget(title_label)
+        # 学校标识
+        school_image = QLabel()
+        school_image.setPixmap(QPixmap(lower_config.ui_school_path))
+        school_image.setAlignment(Qt.AlignmentFlag.AlignRight)
+        top_layout.addWidget(school_image)
+
+        main_layout.addLayout(top_layout)
 
         # 配置区域
         config_group = QGroupBox("设备配置")

@@ -67,6 +67,29 @@ class LowerConfig:
         self.save()
 
     @property
+    def ui_NQI_path(self):
+        return self.config.get('ui', 'NQI_path')
+
+    @ui_NQI_path.setter
+    def ui_NQI_path(self, value):
+        self.set('ui', 'NQI_path', value)
+
+    @property
+    def ui_school_path(self):
+        return self.config.get('ui', 'school_path')
+
+    @ui_school_path.setter
+    def ui_school_path(self, value):
+        self.set('ui', 'school_path', value)
+    @property
+    def server_url(self):
+        return self.config.get('server', 'url')
+
+    @server_url.setter
+    def server_url(self, value):
+        self.set('server', 'url', value)
+
+    @property
     def server_url(self):
         return self.config.get('server', 'url')
 
