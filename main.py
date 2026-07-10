@@ -4,17 +4,17 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QTextEdit, QFileDialog, QMessageBox, QGroupBox,
                              QProgressBar, QListWidget, QListWidgetItem, QSplitter,
                              QTabWidget, QFrame, QRadioButton, QButtonGroup, QCheckBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QThreadPool, QRunnable, pyqtSlot
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QThreadPool, QRunnable, pyqtSlot, QTimer
 from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap, QGuiApplication
 from pathlib import Path
 from loguru import logger
 import socket
+import requests
 from datetime import datetime
 
 from config.config import lower_config
 from security.hardware_key import hardware_key_generator
 from api.api_client import APIClient
-from api.websocket_client import DeviceWebSocketThread
 from api.long_polling_client import LowerLongPollingThread
 from metadata.meter_data import MeterDataManager, DataType, MeterData
 
@@ -30,13 +30,14 @@ class UploadWorker(QRunnable):
         finished = pyqtSignal(str, bool, str)  # 文件名, 成功, 消息
 
     def __init__(self, client: APIClient, device_id: str, hardware_key: str,
-                 meter_data: MeterData):
+                 meter_data: MeterData, location: str = None):
         super().__init__()
         self.signals = UploadWorker.Signals()
         self.client = client
         self.device_id = device_id
         self.hardware_key = hardware_key
         self.meter_data = meter_data
+        self.location = location
 
     @pyqtSlot()
     def run(self):
@@ -49,7 +50,8 @@ class UploadWorker(QRunnable):
                 self.device_id,
                 self.hardware_key,
                 self.meter_data.file_path,
-                self.meter_data.description
+                self.meter_data.description,
+                location=self.location
             )
 
             self.signals.progress.emit(file_name, 100)
@@ -73,6 +75,55 @@ class UploadWorker(QRunnable):
         except Exception as e:
             self.signals.progress.emit(file_name, 0)
             self.signals.finished.emit(file_name, False, f"上传失败: {str(e)}")
+
+
+class AsyncTaskThread(QThread):
+    """通用后台任务线程，用于把网络请求从主界面线程中拆出去。"""
+
+    result_ready = pyqtSignal(object)
+    error_occurred = pyqtSignal(str)
+
+    def __init__(self, target, parent=None):
+        super().__init__(parent)
+        self.target = target
+
+    def run(self):
+        try:
+            self.result_ready.emit(self.target())
+        except Exception as exc:
+            logger.exception(f"后台任务执行失败: {exc}")
+            self.error_occurred.emit(str(exc))
+
+
+class LoadingOverlay(QWidget):
+    """下位机统一 loading 遮罩。"""
+
+    def __init__(self, parent=None, text="处理中..."):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setStyleSheet(
+            "QWidget { background-color: rgba(0, 0, 0, 135); }"
+            "QLabel { color: white; font-size: 15px; font-weight: bold; }"
+            "QProgressBar { border: 1px solid white; border-radius: 6px; text-align: center; background: rgba(255,255,255,40); }"
+            "QProgressBar::chunk { background-color: #4CAF50; border-radius: 5px; }"
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label = QLabel(text)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.progress.setFixedWidth(240)
+        layout.addWidget(self.label, alignment=Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.progress, alignment=Qt.AlignmentFlag.AlignCenter)
+
+    def update_text(self, text: str):
+        self.label.setText(text)
+
+    def resize_to_parent(self):
+        if self.parent() is not None:
+            self.setGeometry(self.parent().rect())
 
 
 class MeterDataListItem(QFrame):
@@ -166,19 +217,35 @@ class MeterDataListItem(QFrame):
 class LowerComputerWindow(QMainWindow):
     """下位机主窗口 - 三相表数据上传"""
 
+    connected_signal = pyqtSignal()
+    disconnected_signal = pyqtSignal()
+    error_signal = pyqtSignal(str)
+    registration_pending_signal = pyqtSignal()
+
     def __init__(self):
         super().__init__()
         self.client = None
-        self.ws_thread = None  # WebSocket 长连接线程（向后兼容）
         self.long_polling_thread = None  # HTTP长轮询心跳线程
-        self.connection_mode = 'long_polling'  # 连接模式：'websocket' 或 'long_polling'
         self.authenticated = False
         self.data_items = {}  # 文件路径 -> MeterDataListItem
         self.meter_data_manager = MeterDataManager(lower_config.cache_dir)
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(lower_config.concurrent_uploads)
+        self.registration_status_timer = QTimer(self)
+        self.registration_status_timer.setInterval(10000)
+        self.registration_status_timer.timeout.connect(lambda: self.query_registration_status(silent=True, show_dialog=True))
+        self.last_registration_status = None
+        self.last_registration_request_id = None
+        self.loading_overlay = None
+        self.active_async_threads = []
+        self.pending_upload_count = 0
         self.init_ui()
         self.load_config()
+        self.connected_signal.connect(self.on_connected)
+        self.disconnected_signal.connect(self.on_disconnected)
+        self.error_signal.connect(self.on_error)
+        self.registration_pending_signal.connect(self.on_registration_pending)
+        QTimer.singleShot(500, self.auto_detect_location)
 
     def init_ui(self):
         """初始化界面"""
@@ -238,6 +305,11 @@ class LowerComputerWindow(QMainWindow):
         self.device_name_input = QLineEdit()
         row2_layout.addWidget(self.device_name_input)
 
+        row2_layout.addWidget(QLabel("所在城市:"))
+        self.location_input = QLineEdit()
+        self.location_input.setPlaceholderText("例如：长沙市")
+        row2_layout.addWidget(self.location_input)
+
         row2_layout.addWidget(QLabel("硬件密钥:"))
         self.hardware_key_label = QLabel("未生成")
         self.hardware_key_label.setStyleSheet("color: blue;")
@@ -254,6 +326,10 @@ class LowerComputerWindow(QMainWindow):
         self.register_btn.clicked.connect(self.register_device)
         button_layout.addWidget(self.register_btn)
 
+        self.query_status_btn = QPushButton("查看注册状态")
+        self.query_status_btn.clicked.connect(self.query_registration_status)
+        button_layout.addWidget(self.query_status_btn)
+
         self.connect_btn = QPushButton("连接服务器")
         self.connect_btn.clicked.connect(self.connect_to_server)
         button_layout.addWidget(self.connect_btn)
@@ -265,9 +341,20 @@ class LowerComputerWindow(QMainWindow):
         button_layout.addStretch()
         config_layout.addLayout(button_layout)
 
+        status_layout = QHBoxLayout()
+        status_layout.addWidget(QLabel("注册状态:"))
+        self.registration_status_label = QLabel("未查询")
+        self.registration_status_label.setStyleSheet("color: gray; font-weight: bold;")
+        status_layout.addWidget(self.registration_status_label)
+        status_layout.addWidget(QLabel("审批进度:"))
+        self.registration_detail_label = QLabel("请先提交注册申请")
+        self.registration_detail_label.setWordWrap(True)
+        self.registration_detail_label.setStyleSheet("color: #666666;")
+        status_layout.addWidget(self.registration_detail_label, stretch=1)
+        config_layout.addLayout(status_layout)
+
         config_group.setLayout(config_layout)
         main_layout.addWidget(config_group)
-
         # 分割器
         splitter = QSplitter(Qt.Orientation.Vertical)
 
@@ -414,37 +501,295 @@ class LowerComputerWindow(QMainWindow):
         # # 刷新缓存信息
         # self.refresh_cache_info()
 
+    def show_loading(self, text: str = "处理中..."):
+        """显示统一 loading 遮罩，避免按钮点击后没有反馈。"""
+        if self.loading_overlay is None:
+            self.loading_overlay = LoadingOverlay(self, text)
+        else:
+            self.loading_overlay.update_text(text)
+        self.loading_overlay.resize_to_parent()
+        self.loading_overlay.raise_()
+        self.loading_overlay.show()
+        QApplication.processEvents()
+
+    def update_loading_text(self, text: str):
+        """更新 loading 文案。"""
+        if self.loading_overlay is not None:
+            self.loading_overlay.update_text(text)
+            QApplication.processEvents()
+
+    def hide_loading(self):
+        """隐藏 loading 遮罩。"""
+        if self.loading_overlay is not None:
+            self.loading_overlay.hide()
+
+    def _set_buttons_enabled(self, buttons, enabled: bool):
+        if buttons is None:
+            return
+        if not isinstance(buttons, (list, tuple, set)):
+            buttons = [buttons]
+        for button in buttons:
+            if button is not None:
+                button.setEnabled(enabled)
+
+    def run_background_task(self, target, on_success, on_error=None, loading_text="处理中...", show_loading=True, buttons=None):
+        """统一封装后台任务线程，让网络请求通过信号槽回到主线程。"""
+        if show_loading:
+            self.show_loading(loading_text)
+        self._set_buttons_enabled(buttons, False)
+
+        thread = AsyncTaskThread(target, parent=self)
+        self.active_async_threads.append(thread)
+
+        def cleanup():
+            self._set_buttons_enabled(buttons, True)
+            if show_loading:
+                self.hide_loading()
+            if thread in self.active_async_threads:
+                self.active_async_threads.remove(thread)
+            thread.deleteLater()
+
+        def handle_success(result):
+            cleanup()
+            on_success(result)
+
+        def handle_error(message):
+            cleanup()
+            if on_error is not None:
+                on_error(message)
+            else:
+                QMessageBox.critical(self, "错误", message)
+
+        thread.result_ready.connect(handle_success)
+        thread.error_occurred.connect(handle_error)
+        thread.start()
+        return thread
+
     def load_config(self):
         """加载配置"""
         self.server_input.setText(lower_config.server_url)
         self.device_id_input.setText(lower_config.device_id)
         self.device_name_input.setText(lower_config.device_name)
+        self.location_input.setText(lower_config.location)
+        self.registration_status_label.setText("未查询")
+        self.registration_detail_label.setText("请先提交注册申请")
 
         if lower_config.hardware_key:
             self.hardware_key_label.setText(lower_config.hardware_key[:16] + "...")
 
+    @staticmethod
+    def _normalize_city_name(city: str) -> str:
+        """把网络接口返回的城市名整理成市级展示文本。"""
+        city = (city or "").strip()
+        if not city:
+            return ""
+        has_chinese = any('\u4e00' <= char <= '\u9fff' for char in city)
+        municipality_map = {"北京": "北京市", "上海": "上海市", "天津": "天津市", "重庆": "重庆市"}
+        if city in municipality_map:
+            return municipality_map[city]
+        if has_chinese and not city.endswith(("市", "区", "县", "州", "盟")):
+            return f"{city}市"
+        return city
+
+    def detect_city_by_network(self) -> str:
+        """根据公网 IP 自动定位城市，失败时抛出异常让调用方保留配置值。"""
+        endpoints = [
+            ("ip-api", "http://ip-api.com/json/?lang=zh-CN", lambda data: data.get("city")),
+            ("百度定位", "https://qifu-api.baidubce.com/ip/local/geo/v1/district", lambda data: (data.get("data") or {}).get("city")),
+            ("ipapi", "https://ipapi.co/json/", lambda data: data.get("city")),
+        ]
+        headers = {"User-Agent": "NQI-Lower-Client/1.0"}
+        last_error = ""
+        for name, url, parser in endpoints:
+            try:
+                response = requests.get(url, headers=headers, timeout=4)
+                response.raise_for_status()
+                city = self._normalize_city_name(parser(response.json()))
+                if city:
+                    return city
+            except Exception as exc:
+                last_error = f"{name}: {exc}"
+                logger.warning(f"网络定位接口失败: {last_error}")
+        raise Exception(last_error or "未获取到城市信息")
+
+    def auto_detect_location(self):
+        """启动后自动定位城市；不阻塞界面，失败则沿用配置中的城市。"""
+        original_location = self.location_input.text().strip()
+        self.statusBar().showMessage("正在自动定位所在城市...")
+
+        def task():
+            return self.detect_city_by_network()
+
+        def on_success(city):
+            current_location = self.location_input.text().strip()
+            # 如果用户在定位返回前手动修改过城市，尊重用户输入，不强行覆盖。
+            if not current_location or current_location == original_location:
+                self.location_input.setText(city)
+                lower_config.location = city
+            else:
+                lower_config.location = current_location
+            self.log(f"自动定位所在城市: {lower_config.location}")
+            if not self.authenticated:
+                self.statusBar().showMessage(f"所在城市: {lower_config.location}")
+
+        def on_error(message):
+            fallback = original_location or lower_config.location
+            self.location_input.setText(fallback)
+            self.log(f"自动定位城市失败，沿用配置城市: {fallback}；原因: {message}", error=True)
+            if not self.authenticated:
+                self.statusBar().showMessage(f"所在城市: {fallback}")
+
+        self.run_background_task(
+            task,
+            on_success=on_success,
+            on_error=on_error,
+            loading_text="正在自动定位所在城市...",
+            show_loading=False,
+        )
+
+    def _start_registration_status_polling(self):
+        """待审批期间定时刷新注册状态。"""
+        if not self.registration_status_timer.isActive():
+            self.registration_status_timer.start()
+
+    def _stop_registration_status_polling(self):
+        """审批完成后停止自动刷新。"""
+        if self.registration_status_timer.isActive():
+            self.registration_status_timer.stop()
+
+    def _apply_registration_status(self, result: dict):
+        """把服务器返回的注册状态映射到界面和按钮状态。"""
+        status = result.get("registration_status", "unknown")
+        status_text = result.get("status_text", "未返回状态说明")
+        queue_position = result.get("queue_position")
+        review_message = result.get("review_message") or ""
+        requested_at = result.get("requested_at") or "-"
+        reviewed_at = result.get("reviewed_at") or "-"
+
+        color_map = {
+            "approved": "green",
+            "pending": "#b45309",
+            "rejected": "red",
+            "unregistered": "gray",
+        }
+        label_map = {
+            "approved": "已通过",
+            "pending": "待审批",
+            "rejected": "已驳回",
+            "unregistered": "未注册",
+        }
+        self.registration_status_label.setText(label_map.get(status, status))
+        self.registration_status_label.setStyleSheet(
+            f"color: {color_map.get(status, '#1f2937')}; font-weight: bold;"
+        )
+
+        detail_lines = [status_text, f"申请时间: {requested_at}"]
+        if queue_position not in (None, 0):
+            detail_lines.append(f"当前排队序号: {queue_position}")
+        if reviewed_at != "-":
+            detail_lines.append(f"审批时间: {reviewed_at}")
+        if review_message:
+            detail_lines.append(f"审批意见: {review_message}")
+        self.registration_detail_label.setText(" | ".join(detail_lines))
+
+        if status == "pending":
+            self._start_registration_status_polling()
+            self.authenticated = False
+            self.add_excel_btn.setEnabled(False)
+            self.add_image_btn.setEnabled(False)
+            self.upload_btn.setEnabled(False)
+            self.statusBar().showMessage("注册待审批")
+        elif status == "approved":
+            self._stop_registration_status_polling()
+            self.statusBar().showMessage("设备审批已通过，可连接服务器")
+        else:
+            self.authenticated = False
+            self.add_excel_btn.setEnabled(False)
+            self.add_image_btn.setEnabled(False)
+            self.upload_btn.setEnabled(False)
+            self.statusBar().showMessage(status_text)
+            if status != "unregistered":
+                self._stop_registration_status_polling()
+
+    def _query_registration_status_sync(self, server_url: str, device_id: str, hardware_key: str):
+        """同步查询注册状态，供后台线程复用。"""
+        client = APIClient(server_url)
+        return client.get_registration_status(device_id, hardware_key)
+
+    def query_registration_status(self, silent: bool = False, show_dialog: bool = True):
+        """查询当前设备的注册审批状态或进度。"""
+        server_url = self.server_input.text().strip()
+        device_id = self.device_id_input.text().strip()
+        hardware_key = lower_config.hardware_key
+
+        if not all([server_url, device_id, hardware_key]):
+            if not silent:
+                QMessageBox.warning(self, "提示", "请先填写服务器地址、设备ID并生成硬件密钥")
+            return None
+
+        def task():
+            return self._query_registration_status_sync(server_url, device_id, hardware_key)
+
+        def on_success(result):
+            self.client = APIClient(server_url)
+            status = result.get("registration_status", "unknown")
+            request_id = result.get("request_id")
+            status_changed = (
+                status != self.last_registration_status
+                or request_id != self.last_registration_request_id
+            )
+            self.last_registration_status = status
+            self.last_registration_request_id = request_id
+            self._apply_registration_status(result)
+
+            if status_changed or not silent:
+                self.log(f"注册状态更新: {result.get('status_text', status)}")
+
+            if show_dialog and status_changed:
+                if status == "approved":
+                    QMessageBox.information(self, "审批通过", "设备注册审批已通过，现在可以连接服务器。")
+                elif status == "rejected":
+                    QMessageBox.warning(self, "审批驳回", result.get("review_message") or "注册申请已被驳回")
+
+        def on_error(message):
+            if not silent:
+                self.log(f"查询注册状态失败: {message}", error=True)
+                QMessageBox.critical(self, "错误", f"查询注册状态失败: {message}")
+
+        return self.run_background_task(
+            task,
+            on_success=on_success,
+            on_error=on_error,
+            loading_text="正在查询注册状态...",
+            show_loading=not silent,
+            buttons=[self.query_status_btn, self.register_btn, self.connect_btn],
+        )
+
     def save_current_config(self):
-        """保存当前配置"""
+        """保存当前配置。"""
+        self.show_loading("正在保存配置...")
         try:
             lower_config.server_url = self.server_input.text().strip()
             lower_config.device_id = self.device_id_input.text().strip()
             lower_config.device_name = self.device_name_input.text().strip()
-
+            lower_config.location = self.location_input.text().strip()
             self.log("配置已保存到 lower_config.ini")
             QMessageBox.information(self, "成功", "配置已保存！")
         except Exception as e:
             self.log(f"保存配置失败: {e}", error=True)
             QMessageBox.critical(self, "错误", f"保存失败: {e}")
+        finally:
+            self.hide_loading()
 
     def generate_hardware_key(self):
-        """生成硬件密钥"""
+        """生成硬件密钥。"""
+        self.show_loading("正在生成硬件密钥...")
         try:
             hardware_key = hardware_key_generator.get_machine_id()
             if hardware_key:
                 lower_config.hardware_key = hardware_key
                 self.hardware_key_label.setText(hardware_key[:16] + "...")
                 self.log("硬件密钥生成成功")
-                # 剪贴板
                 QGuiApplication.clipboard().setText(hardware_key)
                 QMessageBox.information(self, "成功", f"硬件密钥已生成\n{hardware_key},且已经复制到剪贴板")
             else:
@@ -452,116 +797,143 @@ class LowerComputerWindow(QMainWindow):
         except Exception as e:
             self.log(f"生成硬件密钥失败: {e}", error=True)
             QMessageBox.critical(self, "错误", f"生成失败: {e}")
+        finally:
+            self.hide_loading()
 
     def register_device(self):
-        """注册设备"""
-        try:
-            server_url = self.server_input.text().strip()
-            device_id = self.device_id_input.text().strip()
-            device_name = self.device_name_input.text().strip()
-            hardware_key = lower_config.hardware_key
+        """异步提交设备注册申请。"""
+        server_url = self.server_input.text().strip()
+        device_id = self.device_id_input.text().strip()
+        device_name = self.device_name_input.text().strip()
+        location = self.location_input.text().strip()
+        hardware_key = lower_config.hardware_key
 
-            if not all([server_url, device_id, device_name, hardware_key]):
-                QMessageBox.warning(self, "警告", "请填写所有必要信息并生成硬件密钥")
-                return
+        if not all([server_url, device_id, device_name, hardware_key, location]):
+            QMessageBox.warning(self, "警告", "请填写服务器、设备信息、所在城市并生成硬件密钥")
+            return
 
-            # 保存配置
-            lower_config.device_id = device_id
-            lower_config.device_name = device_name
+        lower_config.device_id = device_id
+        lower_config.device_name = device_name
+        lower_config.location = location
 
-            # 创建客户端
-            self.client = APIClient(server_url)
-
-            # 获取本机IP
+        def task():
+            client = APIClient(server_url)
             device_ip = self.get_local_ip()
+            # 注册申请带上城市，服务器会保存到待审批记录。
+            result = client.register_device(device_id, device_name, hardware_key, device_ip, location)
+            return {"result": result, "server_url": server_url}
 
-            # 注册设备
-            result = self.client.register_device(device_id, device_name, hardware_key, device_ip)
-            if result.get('message',None) is not None  :
-                self.log(f"设备注册成功: {result.get('message')}")
-                QMessageBox.information(self, "成功", "设备注册成功！")
+        def on_success(payload):
+            self.client = APIClient(payload["server_url"])
+            result = payload["result"]
+            registration_state = result.get("status")
+
+            if registration_state == "pending":
+                self.log(f"设备注册申请已提交，等待上位机审批: {result.get('request_id')}")
+                self.query_registration_status(silent=True, show_dialog=False)
+                QMessageBox.information(self, "等待审批", "注册申请已提交，请等待上位机审批。")
+            elif registration_state == "approved":
+                self.log(f"设备已审批，可直接连接服务器: {result.get('device_id')}")
+                self.query_registration_status(silent=True, show_dialog=False)
+                QMessageBox.information(self, "已审批", "该设备已经审批通过，可以直接连接服务器。")
             else:
-                self.log(f"设备注册失败: {result.get('detail',None)}", error=True)
-                QMessageBox.critical(self, "错误", f"注册失败: {result.get('detail',None)}")
-        except Exception as e:
-            self.log(f"设备注册失败: {e}", error=True)
-            QMessageBox.critical(self, "错误", f"注册失败: {e}")
+                detail = result.get('detail', result.get('message', '注册失败'))
+                self.log(f"设备注册失败: {detail}", error=True)
+                QMessageBox.critical(self, "错误", f"注册失败: {detail}")
+
+        def on_error(message):
+            self.log(f"设备注册失败: {message}", error=True)
+            QMessageBox.critical(self, "错误", f"注册失败: {message}")
+
+        self.run_background_task(
+            task,
+            on_success=on_success,
+            on_error=on_error,
+            loading_text="正在提交设备注册申请...",
+            buttons=[self.register_btn, self.query_status_btn, self.connect_btn],
+        )
 
     def connect_to_server(self):
-        """连接到服务器"""
-        try:
-            server_url = self.server_input.text().strip()
-            device_id = self.device_id_input.text().strip()
-            hardware_key = lower_config.hardware_key
+        """异步连接到服务器。"""
+        server_url = self.server_input.text().strip()
+        device_id = self.device_id_input.text().strip()
+        location = self.location_input.text().strip()
+        hardware_key = lower_config.hardware_key
 
-            if not all([server_url, device_id, hardware_key]):
-                QMessageBox.warning(self, "警告", "请填写必要信息")
-                return
+        if not all([server_url, device_id, hardware_key, location]):
+            QMessageBox.warning(self, "警告", "请填写服务器、设备ID、所在城市并生成硬件密钥")
+            return
 
-            # 创建客户端
-            self.client = APIClient(server_url)
+        lower_config.server_url = server_url
+        lower_config.device_id = device_id
+        lower_config.location = location
 
-            # 获取本机IP
+        def task():
+            registration_result = self._query_registration_status_sync(server_url, device_id, hardware_key)
+            if registration_result.get("registration_status") != "approved":
+                raise Exception(registration_result.get("status_text", "设备尚未审批，暂时不能连接服务器"))
+
+            client = APIClient(server_url)
             device_ip = self.get_local_ip()
+            # 认证连接时刷新服务器设备表里的城市位置。
+            auth_result = client.authenticate_device(device_id, hardware_key, device_ip, location)
+            return {
+                "server_url": server_url,
+                "registration_result": registration_result,
+                "auth_result": auth_result,
+            }
 
-            # 认证设备
-            result = self.client.authenticate_device(device_id, hardware_key, device_ip)
-
+        def on_success(payload):
+            self.client = APIClient(payload["server_url"])
             self.authenticated = True
-            self.log(f"连接成功: {result.get('message')}")
-            
-            # 根据模式选择连接方式
-            if self.connection_mode == 'long_polling':
-                # 使用HTTP长轮询心跳
-                self.long_polling_thread = LowerLongPollingThread(
-                    server_url=server_url,
-                    device_id=device_id,
-                    hardware_key=hardware_key
-                )
-                
-                # 启动心跳线程
-                self.long_polling_thread.start()
-                self.log("正在启动HTTP心跳保活...")
-                
-                self.statusBar().showMessage("已连接 ✓ (HTTP长轮询)")
-                
-            else:
-                # 使用WebSocket（向后兼容）
-                self.ws_thread = DeviceWebSocketThread(
-                    server_url=server_url,
-                    device_id=device_id,
-                    hardware_key=hardware_key
-                )
-                
-                # 设置 WebSocket 回调
-                self.ws_thread.set_connected_callback(self.on_connected)
-                self.ws_thread.set_disconnected_callback(self.on_disconnected)
-                self.ws_thread.set_error_callback(self.on_error)
-                
-                # 启动 WebSocket 线程
-                self.ws_thread.start()
-                self.log("正在建立 WebSocket 长连接...")
-                
-                self.statusBar().showMessage("已连接 ✓ (WebSocket)")
+            self._apply_registration_status(payload["registration_result"])
+            self.log(f"连接成功: {payload['auth_result'].get('message')}")
+            self._stop_registration_status_polling()
 
-            # 启用上传功能
+            if self.long_polling_thread:
+                self.long_polling_thread.stop()
+                self.long_polling_thread.join(timeout=3)
+
+            self.long_polling_thread = LowerLongPollingThread(
+                server_url=payload["server_url"],
+                device_id=device_id,
+                hardware_key=hardware_key,
+                poll_interval=3,
+                location=location
+            )
+            self.long_polling_thread.set_connected_callback(lambda: self.connected_signal.emit())
+            self.long_polling_thread.set_disconnected_callback(lambda: self.disconnected_signal.emit())
+            self.long_polling_thread.set_error_callback(lambda message: self.error_signal.emit(str(message)))
+            self.long_polling_thread.set_registration_pending_callback(lambda: self.registration_pending_signal.emit())
+            self.long_polling_thread.start()
+            self.log("正在建立HTTP长轮询连接...")
+            self.statusBar().showMessage("已连接 ✓ (HTTP长轮询)")
+
             self.add_excel_btn.setEnabled(True)
             self.add_image_btn.setEnabled(True)
             self.remove_file_btn.setEnabled(True)
             self.clear_files_btn.setEnabled(True)
-
+            self.update_data_count()
             QMessageBox.information(self, "成功", "连接服务器成功！")
 
-        except Exception as e:
+        def on_error(message):
             self.authenticated = False
-            self.log(f"连接失败: {e}", error=True)
+            self.log(f"连接失败: {message}", error=True)
             self.statusBar().showMessage("连接失败 ✗")
-            QMessageBox.critical(self, "错误", f"连接失败: {e}")
+            self.query_registration_status(silent=True, show_dialog=False)
+            QMessageBox.critical(self, "错误", f"连接失败: {message}")
+
+        self.run_background_task(
+            task,
+            on_success=on_success,
+            on_error=on_error,
+            loading_text="正在连接服务器并校验审批状态...",
+            buttons=[self.connect_btn, self.register_btn, self.query_status_btn],
+        )
 
     def add_excel_files(self):
-        """添加电量数据（Excel）"""
+        """添加电量数据（Excel）。"""
         start_dir = lower_config.last_excel_dir or ""
-
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "选择电量数据文件",
@@ -570,16 +942,17 @@ class LowerComputerWindow(QMainWindow):
         )
 
         if file_paths:
-            # 保存浏览目录
-            lower_config.last_excel_dir = str(Path(file_paths[0]).parent)
-
-            for file_path in file_paths:
-                self.add_meter_data(Path(file_path), DataType.EXCEL)
+            self.show_loading("正在加载电量数据文件...")
+            try:
+                lower_config.last_excel_dir = str(Path(file_paths[0]).parent)
+                for file_path in file_paths:
+                    self.add_meter_data(Path(file_path), DataType.EXCEL)
+            finally:
+                self.hide_loading()
 
     def add_image_files(self):
-        """添加几何量数据（图片）"""
+        """添加几何量数据（图片）。"""
         start_dir = lower_config.last_image_dir or ""
-
         file_paths, _ = QFileDialog.getOpenFileNames(
             self,
             "选择几何量数据文件",
@@ -588,11 +961,13 @@ class LowerComputerWindow(QMainWindow):
         )
 
         if file_paths:
-            # 保存浏览目录
-            lower_config.last_image_dir = str(Path(file_paths[0]).parent)
-
-            for file_path in file_paths:
-                self.add_meter_data(Path(file_path), DataType.IMAGE)
+            self.show_loading("正在加载几何量数据文件...")
+            try:
+                lower_config.last_image_dir = str(Path(file_paths[0]).parent)
+                for file_path in file_paths:
+                    self.add_meter_data(Path(file_path), DataType.IMAGE)
+            finally:
+                self.hide_loading()
 
     def add_meter_data(self, file_path: Path, data_type: DataType):
         """添加三相表数据"""
@@ -639,20 +1014,23 @@ class LowerComputerWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请选择要移除的数据")
             return
 
-        for item in selected_items:
-            row = self.data_list_widget.row(item)
-            widget = self.data_list_widget.itemWidget(item)
+        self.show_loading("正在移除选中数据...")
+        try:
+            for item in selected_items:
+                row = self.data_list_widget.row(item)
+                widget = self.data_list_widget.itemWidget(item)
 
-            if widget:
-                # 从字典中移除
-                file_path = str(widget.meter_data.file_path)
-                if file_path in self.data_items:
-                    del self.data_items[file_path]
+                if widget:
+                    file_path = str(widget.meter_data.file_path)
+                    if file_path in self.data_items:
+                        del self.data_items[file_path]
 
-            self.data_list_widget.takeItem(row)
+                self.data_list_widget.takeItem(row)
 
-        self.update_data_count()
-        self.log(f"移除了 {len(selected_items)} 个数据")
+            self.update_data_count()
+            self.log(f"移除了 {len(selected_items)} 个数据")
+        finally:
+            self.hide_loading()
 
     def clear_data_list(self):
         """清空数据列表"""
@@ -665,26 +1043,38 @@ class LowerComputerWindow(QMainWindow):
             )
 
             if reply == QMessageBox.StandardButton.Yes:
-                self.data_list_widget.clear()
-                self.data_items.clear()
-                self.update_data_count()
-                self.log("已清空数据列表")
+                self.show_loading("正在清空数据列表...")
+                try:
+                    self.data_list_widget.clear()
+                    self.data_items.clear()
+                    self.update_data_count()
+                    self.log("已清空数据列表")
+                finally:
+                    self.hide_loading()
 
     def select_all_data(self):
         """全选数据"""
-        for file_info in self.data_items.values():
-            widget = file_info['widget']
-            if not widget.uploaded:
-                widget.checkbox.setChecked(True)
-        self.log("已全选数据")
+        self.show_loading("正在全选数据...")
+        try:
+            for file_info in self.data_items.values():
+                widget = file_info['widget']
+                if not widget.uploaded:
+                    widget.checkbox.setChecked(True)
+            self.log("已全选数据")
+        finally:
+            self.hide_loading()
     
     def deselect_all_data(self):
         """全不选数据"""
-        for file_info in self.data_items.values():
-            widget = file_info['widget']
-            if not widget.uploaded:
-                widget.checkbox.setChecked(False)
-        self.log("已全不选数据")
+        self.show_loading("正在取消选择...")
+        try:
+            for file_info in self.data_items.values():
+                widget = file_info['widget']
+                if not widget.uploaded:
+                    widget.checkbox.setChecked(False)
+            self.log("已全不选数据")
+        finally:
+            self.hide_loading()
     
     def update_data_count(self):
         """更新数据计数"""
@@ -700,7 +1090,7 @@ class LowerComputerWindow(QMainWindow):
         self.deselect_all_btn.setEnabled(total > 0)
 
     def upload_data(self):
-        """上传选中的数据"""
+        """上传选中的数据。"""
         if not self.authenticated:
             QMessageBox.warning(self, "警告", "请先连接服务器")
             return
@@ -709,55 +1099,56 @@ class LowerComputerWindow(QMainWindow):
             QMessageBox.warning(self, "警告", "请先添加要上传的数据")
             return
 
-        # 获取选中的数据
         selected_items = [
             file_info for file_info in self.data_items.values()
             if file_info['widget'].is_selected()
         ]
-        
+
         if not selected_items:
             QMessageBox.warning(self, "警告", "请选择要上传的数据")
             return
 
-        # 禁用按钮
-        self.upload_btn.setEnabled(False)
-        self.stop_upload_btn.setEnabled(True)
-        self.add_excel_btn.setEnabled(False)
-        self.add_image_btn.setEnabled(False)
+        upload_location = self.location_input.text().strip() or lower_config.location
+        if not upload_location:
+            QMessageBox.warning(self, "警告", "请先填写所在城市")
+            return
+        lower_config.location = upload_location
 
-        self.log(f"开始上传 {len(selected_items)} 个数据...")
+        self.show_loading("正在准备上传任务...")
+        try:
+            self.upload_btn.setEnabled(False)
+            self.stop_upload_btn.setEnabled(True)
+            self.add_excel_btn.setEnabled(False)
+            self.add_image_btn.setEnabled(False)
 
-        excel_count = sum(1 for item in selected_items if item['data'].is_excel)
-        image_count = len(selected_items) - excel_count
-        self.log(f"  - 电量数据: {excel_count} 个")
-        self.log(f"  - 几何量数据: {image_count} 个")
+            self.log(f"开始上传 {len(selected_items)} 个数据...")
+            excel_count = sum(1 for item in selected_items if item['data'].is_excel)
+            image_count = len(selected_items) - excel_count
+            self.log(f"  - 电量数据: {excel_count} 个")
+            self.log(f"  - 几何量数据: {image_count} 个")
 
-        # 创建上传任务（仅上传选中的）
-        for file_info in selected_items:
-            data_widget = file_info['widget']
-            meter_data = file_info['data']
+            self.pending_upload_count = len(selected_items)
+            for file_info in selected_items:
+                data_widget = file_info['widget']
+                meter_data = file_info['data']
+                data_widget.set_status("上传中...", "blue")
+                data_widget.set_progress(0)
 
-            # 更新状态
-            data_widget.set_status("上传中...", "blue")
-            data_widget.set_progress(0)
-
-            # 创建工作线程
-            worker = UploadWorker(
-                self.client,
-                lower_config.device_id,
-                lower_config.hardware_key,
-                meter_data
-            )
-
-            # 连接信号
-            worker.signals.progress.connect(self.on_upload_progress)
-            worker.signals.finished.connect(self.on_upload_finished)
-
-            # 添加到线程池
-            self.thread_pool.start(worker)
+                worker = UploadWorker(
+                    self.client,
+                    lower_config.device_id,
+                    lower_config.hardware_key,
+                    meter_data,
+                    location=upload_location
+                )
+                worker.signals.progress.connect(self.on_upload_progress)
+                worker.signals.finished.connect(self.on_upload_finished)
+                self.thread_pool.start(worker)
+        finally:
+            self.hide_loading()
 
     def stop_upload(self):
-        """停止上传"""
+        """停止上传。"""
         reply = QMessageBox.question(
             self,
             "确认",
@@ -766,9 +1157,13 @@ class LowerComputerWindow(QMainWindow):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            self.thread_pool.clear()
-            self.log("已停止上传任务")
-            self.restore_upload_buttons()
+            self.show_loading("正在停止未开始的上传任务...")
+            try:
+                self.thread_pool.clear()
+                self.log("已停止上传任务")
+                self.restore_upload_buttons()
+            finally:
+                self.hide_loading()
 
     @pyqtSlot(str, int)
     def on_upload_progress(self, file_name: str, progress: int):
@@ -905,10 +1300,6 @@ class LowerComputerWindow(QMainWindow):
                 return
 
         # 关闭连接
-        if self.ws_thread:
-            self.log("正在断开 WebSocket 连接...")
-            self.ws_thread.stop()
-            self.ws_thread.join(timeout=3)
         
         if self.long_polling_thread:
             self.log("正在停止HTTP心跳...")
@@ -921,23 +1312,38 @@ class LowerComputerWindow(QMainWindow):
     def on_connected(self):
         """连接成功回调"""
         self.log("[连接] 长连接已建立")
-    
+        self.statusBar().showMessage("已连接 ✓ (HTTP长轮询)")
+
     def on_disconnected(self):
         """断开连接回调"""
+        self.authenticated = False
+        self.add_excel_btn.setEnabled(False)
+        self.add_image_btn.setEnabled(False)
+        self.upload_btn.setEnabled(False)
         self.log("[连接] 连接已断开", error=True)
-    
+        self.statusBar().showMessage("连接已断开 ✗")
+
     def on_error(self, error: str):
         """错误回调"""
+        self.authenticated = False
+        self.add_excel_btn.setEnabled(False)
+        self.add_image_btn.setEnabled(False)
+        self.upload_btn.setEnabled(False)
         self.log(f"[连接] 错误: {error}", error=True)
+        self.statusBar().showMessage("连接异常 ✗")
 
+    def on_registration_pending(self):
+        """长轮询发现当前设备未审批时，自动刷新注册进度。"""
+        self.authenticated = False
+        self.add_excel_btn.setEnabled(False)
+        self.add_image_btn.setEnabled(False)
+        self.upload_btn.setEnabled(False)
+        self.log("[注册] 当前设备仍处于待审批状态")
+        self.query_registration_status(silent=True, show_dialog=False)
+        self.statusBar().showMessage("注册待审批")
 def quit_qt_application(window:LowerComputerWindow):
     """退出应用程序"""
     if window.authenticated:
-        # 关闭 WebSocket 连接
-        if window.ws_thread:
-            logger.info("关闭 WebSocket 连接...")
-            window.ws_thread.stop()
-            window.ws_thread.join(timeout=3)
         
         # 停止HTTP心跳（心跳停止时会自动发送离线通知）
         if window.long_polling_thread:
@@ -966,3 +1372,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+

@@ -23,7 +23,8 @@ class LowerConfig:
         self.config['device'] = {
             'device_id': '',
             'device_name': 'Three-Phase Meter Device',
-            'hardware_key': ''
+            'hardware_key': '',
+            'location': '长沙市'
         }
 
         self.config['upload'] = {
@@ -120,6 +121,14 @@ class LowerConfig:
     @hardware_key.setter
     def hardware_key(self, value):
         self.set('device', 'hardware_key', value)
+
+    @property
+    def location(self):
+        return self.config.get('device', 'location', fallback='长沙市')
+
+    @location.setter
+    def location(self, value):
+        self.set('device', 'location', value)
 
     @property
     def last_excel_dir(self):
