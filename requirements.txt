@@ -1,8 +1,8 @@
-PyQt6==6.6.1
-PyQt6-Qt6==6.6.1
-requests==2.31.0
-openpyxl==3.1.2
-Pillow==10.1.0
+# The lower client uses HTTP long polling only; no WebSocket package is required.
 loguru==0.7.2
 psutil==5.9.6
-websockets>=10.0
+PyQt6==6.6.1
+requests==2.31.0
+
+# main.spec build dependency
+PyInstaller==6.21.0

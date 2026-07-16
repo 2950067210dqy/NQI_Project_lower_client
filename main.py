@@ -195,11 +195,20 @@ class MeterDataListItem(QFrame):
         self.status_label.setStyleSheet(f"color: {color};")
     
     def set_uploaded(self, uploaded: bool = True):
-        """设置为已上传"""
+        """设置上传状态，并阻止成功文件被重复选择上传。"""
         self.uploaded = uploaded
         if uploaded:
             self.checkbox.setChecked(False)
-            # self.checkbox.setEnabled(False)
+            self.checkbox.setEnabled(False)
+            tip = "该文件已上传成功，不能重复选择上传"
+            # 禁用后的复选框仍保留悬停提示，便于用户理解不能勾选的原因。
+            self.checkbox.setToolTip(tip)
+            self.setToolTip(tip)
+        else:
+            # 上传失败或状态被重置时允许用户重新选择上传。
+            self.checkbox.setEnabled(True)
+            self.checkbox.setToolTip("")
+            self.setToolTip("")
     
     def is_selected(self) -> bool:
         """是否被选中"""
@@ -579,11 +588,39 @@ class LowerComputerWindow(QMainWindow):
 
     @staticmethod
     def _normalize_city_name(city: str) -> str:
-        """把网络接口返回的城市名整理成市级展示文本。"""
+        """把网络接口返回的城市名整理成中文市/区县展示文本。"""
         city = (city or "").strip()
         if not city:
             return ""
+
+        english_city_map = {
+            # 常见直辖市/城市英文名映射。网络定位服务偶尔即使请求中文也会返回拼音。
+            "beijing": "北京市",
+            "shanghai": "上海市",
+            "tianjin": "天津市",
+            "chongqing": "重庆市",
+            "changsha": "长沙市",
+            "suzhou": "苏州市",
+            "shenzhen": "深圳市",
+            "guangzhou": "广州市",
+            "hangzhou": "杭州市",
+            "nanjing": "南京市",
+            "wuhan": "武汉市",
+            "chengdu": "成都市",
+            "xian": "西安市",
+            "xi'an": "西安市",
+            # 上海长宁经常被 IP 定位接口返回为 Changning。
+            "changning": "长宁区",
+        }
+        normalized_key = city.lower().replace(" city", "").strip()
+        if normalized_key in english_city_map:
+            return english_city_map[normalized_key]
+
         has_chinese = any('\u4e00' <= char <= '\u9fff' for char in city)
+        if not has_chinese:
+            # 未知英文名不要写入配置，继续尝试其他中文定位接口或走失败回退。
+            return ""
+
         municipality_map = {"北京": "北京市", "上海": "上海市", "天津": "天津市", "重庆": "重庆市"}
         if city in municipality_map:
             return municipality_map[city]
@@ -594,8 +631,9 @@ class LowerComputerWindow(QMainWindow):
     def detect_city_by_network(self) -> str:
         """根据公网 IP 自动定位城市，失败时抛出异常让调用方保留配置值。"""
         endpoints = [
-            ("ip-api", "http://ip-api.com/json/?lang=zh-CN", lambda data: data.get("city")),
+            # 优先使用中文定位接口，避免英文拼音城市名写入配置。
             ("百度定位", "https://qifu-api.baidubce.com/ip/local/geo/v1/district", lambda data: (data.get("data") or {}).get("city")),
+            ("ip-api", "http://ip-api.com/json/?lang=zh-CN", lambda data: data.get("city")),
             ("ipapi", "https://ipapi.co/json/", lambda data: data.get("city")),
         ]
         headers = {"User-Agent": "NQI-Lower-Client/1.0"}
@@ -670,12 +708,14 @@ class LowerComputerWindow(QMainWindow):
             "approved": "green",
             "pending": "#b45309",
             "rejected": "red",
+            "conflict": "red",  # 设备ID已被其他硬件占用。
             "unregistered": "gray",
         }
         label_map = {
             "approved": "已通过",
             "pending": "待审批",
             "rejected": "已驳回",
+            "conflict": "设备ID已占用",
             "unregistered": "未注册",
         }
         self.registration_status_label.setText(label_map.get(status, status))
@@ -1007,17 +1047,23 @@ class LowerComputerWindow(QMainWindow):
         self.log(f"添加{data_type_name}: {file_path.name} ({meter_data.file_size / 1024:.1f} KB)")
 
     def remove_selected_data(self):
-        """移除选中的数据"""
-        selected_items = self.data_list_widget.selectedItems()
+        """移除勾选框选中的数据，忽略鼠标单击造成的列表行选中。"""
+        checked_rows = []
+        for row in range(self.data_list_widget.count()):
+            item = self.data_list_widget.item(row)
+            widget = self.data_list_widget.itemWidget(item)
+            if widget and widget.checkbox.isChecked():
+                checked_rows.append(row)
 
-        if not selected_items:
-            QMessageBox.warning(self, "警告", "请选择要移除的数据")
+        if not checked_rows:
+            QMessageBox.warning(self, "警告", "请勾选要移除的数据")
             return
 
-        self.show_loading("正在移除选中数据...")
+        self.show_loading("正在移除勾选数据...")
         try:
-            for item in selected_items:
-                row = self.data_list_widget.row(item)
+            # 从后往前删除，避免前面行删除后导致后续行号偏移。
+            for row in reversed(checked_rows):
+                item = self.data_list_widget.item(row)
                 widget = self.data_list_widget.itemWidget(item)
 
                 if widget:
@@ -1028,7 +1074,7 @@ class LowerComputerWindow(QMainWindow):
                 self.data_list_widget.takeItem(row)
 
             self.update_data_count()
-            self.log(f"移除了 {len(selected_items)} 个数据")
+            self.log(f"移除了 {len(checked_rows)} 个勾选数据")
         finally:
             self.hide_loading()
 
@@ -1053,14 +1099,27 @@ class LowerComputerWindow(QMainWindow):
                     self.hide_loading()
 
     def select_all_data(self):
-        """全选数据"""
+        """全选所有尚未上传成功的数据。"""
         self.show_loading("正在全选数据...")
         try:
+            selected_count = 0
+            skipped_count = 0
             for file_info in self.data_items.values():
                 widget = file_info['widget']
-                if not widget.uploaded:
-                    widget.checkbox.setChecked(True)
-            self.log("已全选数据")
+                if widget.uploaded:
+                    # 已上传项保持未选中和禁用，防止全选绕过重复上传限制。
+                    widget.checkbox.setChecked(False)
+                    skipped_count += 1
+                    continue
+                widget.checkbox.setChecked(True)
+                selected_count += 1
+
+            if skipped_count:
+                tip = f"已选择 {selected_count} 个待上传文件，跳过 {skipped_count} 个上传成功的文件"
+                self.statusBar().showMessage(tip, 5000)
+                self.log(f"{tip}；上传成功的文件不能重复选择上传")
+            else:
+                self.log(f"已全选 {selected_count} 个数据")
         finally:
             self.hide_loading()
     
@@ -1070,8 +1129,8 @@ class LowerComputerWindow(QMainWindow):
         try:
             for file_info in self.data_items.values():
                 widget = file_info['widget']
-                if not widget.uploaded:
-                    widget.checkbox.setChecked(False)
+                # 已上传项也要响应全不选，否则上传完成后用户会看到按钮点击没有反馈。
+                widget.checkbox.setChecked(False)
             self.log("已全不选数据")
         finally:
             self.hide_loading()
@@ -1105,7 +1164,18 @@ class LowerComputerWindow(QMainWindow):
         ]
 
         if not selected_items:
-            QMessageBox.warning(self, "警告", "请选择要上传的数据")
+            uploaded_count = sum(
+                1 for file_info in self.data_items.values()
+                if file_info['widget'].uploaded
+            )
+            if uploaded_count == len(self.data_items):
+                QMessageBox.information(
+                    self,
+                    "提示",
+                    "列表中的文件均已上传成功，不能重复选择上传。"
+                )
+            else:
+                QMessageBox.warning(self, "警告", "请选择尚未上传的文件")
             return
 
         upload_location = self.location_input.text().strip() or lower_config.location
@@ -1185,6 +1255,8 @@ class LowerComputerWindow(QMainWindow):
 
                     self.log(f"✓ {file_name}: {message}")
                 else:
+                    # 上传失败的文件仍可勾选后重新上传。
+                    file_info['widget'].set_uploaded(False)
                     file_info['widget'].set_status("✗ 失败", "red")
                     file_info['widget'].set_progress(0)
                     self.log(f"✗ {file_name}: {message}", error=True)
@@ -1372,6 +1444,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

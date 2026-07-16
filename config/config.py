@@ -1,17 +1,48 @@
 import configparser
+import sys
 from pathlib import Path
 from datetime import datetime
 
 
 class LowerConfig:
     def __init__(self):
-        self.config_file = Path("lower_config.ini")
+        self.app_dir = self._app_dir()
+        self.bundle_dir = self._bundle_dir()
+        # 打包后 lower_config.ini 复制到 exe 同级目录，方便现场直接修改。
+        self.config_file = self.app_dir / "lower_config.ini"
         self.config = configparser.ConfigParser()
 
         if not self.config_file.exists():
             self.create_default_config()
 
         self.config.read(self.config_file, encoding='utf-8')
+
+    @staticmethod
+    def _app_dir() -> Path:
+        """返回 exe 所在目录；源码运行时返回当前工作目录。"""
+        if getattr(sys, 'frozen', False):
+            return Path(sys.executable).resolve().parent
+        return Path.cwd()
+
+    @staticmethod
+    def _bundle_dir() -> Path:
+        """返回 PyInstaller 资源目录；one-dir 下通常是 exe/_internal。"""
+        if getattr(sys, 'frozen', False):
+            return Path(getattr(sys, '_MEIPASS', Path(sys.executable).resolve().parent))
+        return Path.cwd()
+
+    def _resource_path(self, value: str) -> str:
+        """解析资源路径，打包后优先读取 exe 同级目录的 static 资源。"""
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            return str(path)
+        external_path = self.app_dir / path
+        if external_path.exists():
+            return str(external_path)
+        bundled_path = self.bundle_dir / path
+        if bundled_path.exists():
+            return str(bundled_path)
+        return str(external_path)
 
     def create_default_config(self):
         """创建默认配置"""
@@ -69,7 +100,7 @@ class LowerConfig:
 
     @property
     def ui_NQI_path(self):
-        return self.config.get('ui', 'NQI_path')
+        return self._resource_path(self.config.get('ui', 'NQI_path'))
 
     @ui_NQI_path.setter
     def ui_NQI_path(self, value):
@@ -77,7 +108,7 @@ class LowerConfig:
 
     @property
     def ui_school_path(self):
-        return self.config.get('ui', 'school_path')
+        return self._resource_path(self.config.get('ui', 'school_path'))
 
     @ui_school_path.setter
     def ui_school_path(self, value):
@@ -156,7 +187,7 @@ class LowerConfig:
 
     @property
     def cache_dir(self):
-        return Path(self.config.get('local_storage', 'cache_dir', fallback='./meter_data_cache'))
+        return self.app_dir / self.config.get('local_storage', 'cache_dir', fallback='./meter_data_cache')
 
     def get_excel_description(self):
         """获取电量数据描述"""
