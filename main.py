@@ -425,8 +425,6 @@ class LowerComputerWindow(QMainWindow):
         image_frame.setLayout(image_layout)
         toolbar.addWidget(image_frame)
 
-        upload_layout.addLayout(toolbar)
-
         # 自动文件夹上传配置：监听和网络请求都在后台线程，不阻塞 PyQt 主界面。
         auto_upload_group = QGroupBox("自动文件夹上传")
         auto_upload_layout = QVBoxLayout()
@@ -467,6 +465,12 @@ class LowerComputerWindow(QMainWindow):
         auto_upload_layout.addWidget(auto_upload_tip)
         auto_upload_group.setLayout(auto_upload_layout)
         upload_layout.addWidget(auto_upload_group)
+
+        # 手动控件集中放入独立分组，放在自动配置和数据列表之间。
+        manual_upload_group = QGroupBox("手动文件上传")
+        manual_upload_layout = QVBoxLayout()
+        manual_upload_layout.addLayout(toolbar)
+        upload_layout.addWidget(manual_upload_group)
         # 数据列表
         list_label = QLabel("数据列表:")
         upload_layout.addWidget(list_label)
@@ -514,7 +518,7 @@ class LowerComputerWindow(QMainWindow):
         # 上传操作
         upload_action_layout = QHBoxLayout()
 
-        self.upload_btn = QPushButton("开始上传")
+        self.upload_btn = QPushButton("开始手动上传")
         self.upload_btn.setMinimumHeight(40)
 
         self.upload_btn.clicked.connect(self.upload_data)
@@ -523,7 +527,7 @@ class LowerComputerWindow(QMainWindow):
         self.upload_btn.setStyleSheet("background-color: #4CAF50; color: white;")
         upload_action_layout.addWidget(self.upload_btn)
 
-        self.stop_upload_btn = QPushButton("停止上传")
+        self.stop_upload_btn = QPushButton("停止手动上传")
         self.stop_upload_btn.setMinimumHeight(40)
         self.stop_upload_btn.clicked.connect(self.stop_upload)
         self.stop_upload_btn.setToolTip("仅停止未开始的手动上传任务，对自动监听上传无效")
@@ -531,11 +535,12 @@ class LowerComputerWindow(QMainWindow):
         self.stop_upload_btn.setStyleSheet("background-color: #f44336; color: white;")
         upload_action_layout.addWidget(self.stop_upload_btn)
 
-        upload_layout.addLayout(upload_action_layout)
+        manual_upload_layout.addLayout(upload_action_layout)
         manual_upload_tip = QLabel("提示：开始上传和停止上传按钮仅控制手动上传任务，对自动文件夹监听上传无效。")
         manual_upload_tip.setStyleSheet("color: #8a6d00;")
         manual_upload_tip.setWordWrap(True)
-        upload_layout.addWidget(manual_upload_tip)
+        manual_upload_layout.addWidget(manual_upload_tip)
+        manual_upload_group.setLayout(manual_upload_layout)
 
         upload_group.setLayout(upload_layout)
         splitter.addWidget(upload_group)
@@ -757,6 +762,9 @@ class LowerComputerWindow(QMainWindow):
         except Exception as exc:
             logger.exception(f"同步自动上传数据列表失败: {exc}")
             self.log(f"自动上传列表同步失败: {exc}", error=True)
+        finally:
+            # 自动任务回放或状态更新后，立即刷新数据列表中的总数量与来源分项。
+            self.update_data_count()
 
     @pyqtSlot(str, str)
     def on_auto_file_discovered(self, file_path: str, data_type: str):
@@ -1547,17 +1555,29 @@ class LowerComputerWindow(QMainWindow):
             self.hide_loading()
     
     def update_data_count(self):
-        """更新数据计数"""
-        excel_count = sum(1 for item in self.data_items.values() if item['data'].is_excel)
-        image_count = sum(1 for item in self.data_items.values() if item['data'].is_image)
+        """更新数据列表总数，同时保留手动上传按钮只管理手动任务的规则。"""
+        manual_excel_count = sum(1 for item in self.data_items.values() if item['data'].is_excel)
+        manual_image_count = sum(1 for item in self.data_items.values() if item['data'].is_image)
+        auto_excel_count = sum(1 for item in self.auto_data_items.values() if item['data'].is_excel)
+        auto_image_count = sum(1 for item in self.auto_data_items.values() if item['data'].is_image)
 
-        self.excel_count_label.setText(f"电量数据: {excel_count}")
-        self.image_count_label.setText(f"几何量数据: {image_count}")
+        excel_count = manual_excel_count + auto_excel_count
+        image_count = manual_image_count + auto_image_count
+        self.excel_count_label.setText(
+            "电量数据: {excel} (手动 {manual} / 自动 {automatic})".format(
+                excel=excel_count, manual=manual_excel_count, automatic=auto_excel_count
+            )
+        )
+        self.image_count_label.setText(
+            "几何量数据: {image} (手动 {manual} / 自动 {automatic})".format(
+                image=image_count, manual=manual_image_count, automatic=auto_image_count
+            )
+        )
 
-        total = excel_count + image_count
-        self.upload_btn.setEnabled(total > 0 and self.authenticated)
-        self.select_all_btn.setEnabled(total > 0)
-        self.deselect_all_btn.setEnabled(total > 0)
+        manual_total = manual_excel_count + manual_image_count
+        self.upload_btn.setEnabled(manual_total > 0 and self.authenticated)
+        self.select_all_btn.setEnabled(manual_total > 0)
+        self.deselect_all_btn.setEnabled(manual_total > 0)
 
     def upload_data(self):
         """上传选中的数据。"""
