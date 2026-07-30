@@ -3,8 +3,9 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
                              QTextEdit, QFileDialog, QMessageBox, QGroupBox,
                              QProgressBar, QListWidget, QListWidgetItem, QSplitter,
-                             QTabWidget, QFrame, QRadioButton, QButtonGroup, QCheckBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QThreadPool, QRunnable, pyqtSlot, QTimer
+                             QTabWidget, QFrame, QRadioButton, QButtonGroup, QCheckBox,
+                             QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QThreadPool, QRunnable, pyqtSlot, QTimer, QEvent
 from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap, QGuiApplication
 from pathlib import Path
 from loguru import logger
@@ -17,6 +18,7 @@ from security.hardware_key import hardware_key_generator
 from api.api_client import APIClient
 from api.long_polling_client import LowerLongPollingThread
 from metadata.meter_data import MeterDataManager, DataType, MeterData
+from auto_upload_service import FolderAutoUploadThread, UploadHistoryStore
 
 # 配置日志
 logger.add("logs/lower_{time}.log", rotation="10 MB", retention="30 days", encoding='utf-8')
@@ -129,9 +131,10 @@ class LoadingOverlay(QWidget):
 class MeterDataListItem(QFrame):
     """三相表数据列表项"""
 
-    def __init__(self, meter_data: MeterData, parent=None):
+    def __init__(self, meter_data: MeterData, upload_source: str = "手动上传", parent=None):
         super().__init__(parent)
         self.meter_data = meter_data
+        self.upload_source = upload_source
         self.uploaded = False  # 是否已上传
         self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
         self.init_ui()
@@ -155,6 +158,11 @@ class MeterDataListItem(QFrame):
             type_label.setText("📷 几何量数据")
             type_label.setStyleSheet("color: #cc6600; font-weight: bold;")
         layout.addWidget(type_label, stretch=1)
+
+        # 来源列：自动监听与手动加入的同名文件也能在列表中明确区分。
+        self.source_label = QLabel(f"来源：{self.upload_source}")
+        self.source_label.setStyleSheet("color: #7a4f00;" if self.upload_source == "自动上传" else "color: #555555;")
+        layout.addWidget(self.source_label, stretch=0)
 
         # 文件名
         self.name_label = QLabel(self.meter_data.file_path.name)
@@ -188,6 +196,12 @@ class MeterDataListItem(QFrame):
         self.progress_bar.setMaximumWidth(100)
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar, stretch=0)
+
+        if self.upload_source == "自动上传":
+            # 自动上传由后台监听线程管理，不能被手动批量上传按钮误选。
+            self.checkbox.setChecked(False)
+            self.checkbox.setEnabled(False)
+            self.checkbox.setToolTip("该文件由自动监听任务上传")
 
     def set_status(self, status: str, color: str = "black"):
         """设置状态"""
@@ -236,7 +250,21 @@ class LowerComputerWindow(QMainWindow):
         self.client = None
         self.long_polling_thread = None  # HTTP长轮询心跳线程
         self.authenticated = False
-        self.data_items = {}  # 文件路径 -> MeterDataListItem
+        # 自动上传记录独立保存在 exe/源码运行目录，程序重启后仍可查看和续传。
+        self.upload_history_store = UploadHistoryStore(lower_config.app_dir / "upload_history.sqlite3")
+        self.auto_upload_thread = None
+        # 历史表只在可见时节流刷新，避免后台上传期间频繁重绘造成卡顿。
+        self.upload_history_row_ids = []
+        self.upload_history_refresh_scheduled = False
+        self.upload_history_dirty = False
+        # 用户滚动记录表时暂停重绘，避免后台上传状态刷新抢占界面线程。
+        self.upload_history_interacting = False
+        self.upload_history_interaction_timer = QTimer(self)
+        self.upload_history_interaction_timer.setSingleShot(True)
+        self.upload_history_interaction_timer.timeout.connect(self._resume_upload_history_refresh)
+        self.tab_switch_loading_token = 0
+        self.data_items = {}  # 手动上传：文件路径 -> MeterDataListItem
+        self.auto_data_items = {}  # 自动上传：文件路径 -> MeterDataListItem
         self.meter_data_manager = MeterDataManager(lower_config.cache_dir)
         self.thread_pool = QThreadPool()
         self.thread_pool.setMaxThreadCount(lower_config.concurrent_uploads)
@@ -254,6 +282,7 @@ class LowerComputerWindow(QMainWindow):
         self.disconnected_signal.connect(self.on_disconnected)
         self.error_signal.connect(self.on_error)
         self.registration_pending_signal.connect(self.on_registration_pending)
+        self._start_auto_upload_service()
         QTimer.singleShot(500, self.auto_detect_location)
 
     def init_ui(self):
@@ -398,6 +427,46 @@ class LowerComputerWindow(QMainWindow):
 
         upload_layout.addLayout(toolbar)
 
+        # 自动文件夹上传配置：监听和网络请求都在后台线程，不阻塞 PyQt 主界面。
+        auto_upload_group = QGroupBox("自动文件夹上传")
+        auto_upload_layout = QVBoxLayout()
+        auto_upload_head = QHBoxLayout()
+        self.auto_upload_enabled_checkbox = QCheckBox("启用自动监听")
+        auto_upload_head.addWidget(self.auto_upload_enabled_checkbox)
+        self.auto_upload_status_label = QLabel("自动监听未启用")
+        self.auto_upload_status_label.setStyleSheet("color: #666666;")
+        auto_upload_head.addWidget(self.auto_upload_status_label, stretch=1)
+        self.save_auto_upload_btn = QPushButton("保存监听设置")
+        self.save_auto_upload_btn.clicked.connect(self.save_auto_upload_settings)
+        auto_upload_head.addWidget(self.save_auto_upload_btn)
+        auto_upload_layout.addLayout(auto_upload_head)
+
+        excel_watch_layout = QHBoxLayout()
+        excel_watch_layout.addWidget(QLabel("电量 Excel 文件夹:"))
+        self.auto_excel_directory_input = QLineEdit()
+        self.auto_excel_directory_input.setPlaceholderText("选择仅包含 .xlsx/.xls 文件的监听文件夹")
+        excel_watch_layout.addWidget(self.auto_excel_directory_input, stretch=1)
+        self.choose_auto_excel_dir_btn = QPushButton("选择文件夹")
+        self.choose_auto_excel_dir_btn.clicked.connect(self.choose_auto_excel_directory)
+        excel_watch_layout.addWidget(self.choose_auto_excel_dir_btn)
+        auto_upload_layout.addLayout(excel_watch_layout)
+
+        image_watch_layout = QHBoxLayout()
+        image_watch_layout.addWidget(QLabel("几何量图片文件夹:"))
+        self.auto_image_directory_input = QLineEdit()
+        self.auto_image_directory_input.setPlaceholderText("选择仅包含 jpg/jpeg/png/bmp 文件的监听文件夹")
+        image_watch_layout.addWidget(self.auto_image_directory_input, stretch=1)
+        self.choose_auto_image_dir_btn = QPushButton("选择文件夹")
+        self.choose_auto_image_dir_btn.clicked.connect(self.choose_auto_image_directory)
+        image_watch_layout.addWidget(self.choose_auto_image_dir_btn)
+        auto_upload_layout.addLayout(image_watch_layout)
+
+        auto_upload_tip = QLabel("提示：新增或修改监听文件夹、启用状态等设置后，必须点击“保存监听设置”按钮才会生效。文件连续两次扫描保持不变后才会自动上传；断线或服务器不可用时会记录为等待重试。")
+        auto_upload_tip.setStyleSheet("color: #8a6d00;")
+        auto_upload_tip.setWordWrap(True)
+        auto_upload_layout.addWidget(auto_upload_tip)
+        auto_upload_group.setLayout(auto_upload_layout)
+        upload_layout.addWidget(auto_upload_group)
         # 数据列表
         list_label = QLabel("数据列表:")
         upload_layout.addWidget(list_label)
@@ -449,6 +518,7 @@ class LowerComputerWindow(QMainWindow):
         self.upload_btn.setMinimumHeight(40)
 
         self.upload_btn.clicked.connect(self.upload_data)
+        self.upload_btn.setToolTip("仅控制手动勾选的文件上传，对自动监听上传无效")
         self.upload_btn.setEnabled(False)
         self.upload_btn.setStyleSheet("background-color: #4CAF50; color: white;")
         upload_action_layout.addWidget(self.upload_btn)
@@ -456,11 +526,16 @@ class LowerComputerWindow(QMainWindow):
         self.stop_upload_btn = QPushButton("停止上传")
         self.stop_upload_btn.setMinimumHeight(40)
         self.stop_upload_btn.clicked.connect(self.stop_upload)
+        self.stop_upload_btn.setToolTip("仅停止未开始的手动上传任务，对自动监听上传无效")
         self.stop_upload_btn.setEnabled(False)
         self.stop_upload_btn.setStyleSheet("background-color: #f44336; color: white;")
         upload_action_layout.addWidget(self.stop_upload_btn)
 
         upload_layout.addLayout(upload_action_layout)
+        manual_upload_tip = QLabel("提示：开始上传和停止上传按钮仅控制手动上传任务，对自动文件夹监听上传无效。")
+        manual_upload_tip.setStyleSheet("color: #8a6d00;")
+        manual_upload_tip.setWordWrap(True)
+        upload_layout.addWidget(manual_upload_tip)
 
         upload_group.setLayout(upload_layout)
         splitter.addWidget(upload_group)
@@ -502,14 +577,341 @@ class LowerComputerWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 1)
 
-        main_layout.addWidget(splitter)
-
+        # 用标签页分隔上传操作与本地上传记录，记录页不会影响上传页交互。
+        self.main_tabs = QTabWidget()
+        self.main_tabs.addTab(splitter, "数据上传")
+        self.main_tabs.addTab(self._create_upload_history_page(), "上传记录")
+        self.main_tabs.currentChanged.connect(self.on_main_tab_changed)
+        main_layout.addWidget(self.main_tabs)
         # 状态栏
         self.statusBar().showMessage("未连接")
 
         # # 刷新缓存信息
         # self.refresh_cache_info()
 
+    def _create_upload_history_page(self):
+        """创建本地下位机上传历史页面。"""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        toolbar = QHBoxLayout()
+        self.upload_history_summary_label = QLabel("正在读取本地 SQLite 上传记录...")
+        toolbar.addWidget(self.upload_history_summary_label, stretch=1)
+        self.refresh_upload_history_btn = QPushButton("刷新记录")
+        self.refresh_upload_history_btn.clicked.connect(self.refresh_upload_history)
+        toolbar.addWidget(self.refresh_upload_history_btn)
+        self.delete_upload_history_btn = QPushButton("删除选中记录")
+        self.delete_upload_history_btn.clicked.connect(self.delete_selected_upload_history_records)
+        toolbar.addWidget(self.delete_upload_history_btn)
+        layout.addLayout(toolbar)
+
+        self.upload_history_table = QTableWidget(0, 9)
+        self.upload_history_table.setHorizontalHeaderLabels([
+            "时间", "来源", "类型", "文件名", "状态", "重试", "服务器文件ID", "文件路径", "结果说明"
+        ])
+        self.upload_history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.upload_history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.upload_history_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.upload_history_table.setAlternatingRowColors(True)
+        self.upload_history_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.upload_history_table.horizontalHeader().setStretchLastSection(True)
+        self.upload_history_table.cellDoubleClicked.connect(self.show_upload_history_detail)
+        # 滚轮、拖动滑块、键盘浏览期间均临时停掉后台表格刷新。
+        self.upload_history_table.installEventFilter(self)
+        self.upload_history_table.viewport().installEventFilter(self)
+        self.upload_history_table.verticalScrollBar().sliderPressed.connect(self.pause_upload_history_refresh)
+        self.upload_history_table.verticalScrollBar().sliderMoved.connect(lambda _value: self.pause_upload_history_refresh())
+        self.upload_history_table.verticalScrollBar().sliderReleased.connect(self.defer_upload_history_refresh)
+        layout.addWidget(self.upload_history_table)
+        detail_tip = QLabel("双击记录可查看完整文件路径和上传结果。自动上传失败会按 5、10、20…秒退避重试，最长间隔 5 分钟。")
+        detail_tip.setStyleSheet("color: #666666;")
+        detail_tip.setWordWrap(True)
+        layout.addWidget(detail_tip)
+        return page
+
+    def _auto_upload_settings_from_config(self):
+        """读取兼容旧版 ini 的自动上传配置；首次保存时会自动创建对应节。"""
+        return {
+            "enabled": lower_config.get("auto_upload", "enabled", "false").lower() == "true",
+            "excel_dir": lower_config.get("auto_upload", "excel_directory", ""),
+            "image_dir": lower_config.get("auto_upload", "image_directory", ""),
+            "scan_interval": max(1, int(lower_config.get("auto_upload", "scan_interval_seconds", "3"))),
+            "request_timeout": max(3, int(lower_config.get("auto_upload", "request_timeout_seconds", "10"))),
+            "connected": self.authenticated,
+            "server_url": self.server_input.text().strip(),
+            "device_id": self.device_id_input.text().strip(),
+            "hardware_key": lower_config.hardware_key,
+            "location": self.location_input.text().strip(),
+        }
+
+    def _start_auto_upload_service(self):
+        """启动后台监听线程；线程不访问 Qt 控件，只通过信号返回界面。"""
+        if self.auto_upload_thread is not None:
+            return
+        recovered_count = self.upload_history_store.recover_interrupted_auto_uploads()
+        if recovered_count:
+            self.log(f"自动上传已恢复 {recovered_count} 条上次中断的任务")
+        self.auto_upload_thread = FolderAutoUploadThread(self.upload_history_store, self)
+        self.auto_upload_thread.status_changed.connect(self.on_auto_upload_status_changed)
+        self.auto_upload_thread.file_discovered.connect(self.on_auto_file_discovered)
+        self.auto_upload_thread.upload_started.connect(self.on_auto_upload_started)
+        self.auto_upload_thread.upload_result.connect(self.on_auto_upload_result)
+        self.auto_upload_thread.history_changed.connect(self.schedule_upload_history_refresh)
+        self.auto_upload_thread.update_settings(**self._auto_upload_settings_from_config())
+        self.auto_upload_thread.start()
+        # 启动时从 SQLite 回放已有自动任务，避免错过线程启动前的历史信号。
+        QTimer.singleShot(0, self.sync_auto_upload_data_list)
+        self.refresh_upload_history()
+
+    def _sync_auto_upload_runtime(self):
+        """把最新的连接与目录配置安全传给后台监听线程。"""
+        if self.auto_upload_thread is not None:
+            self.auto_upload_thread.update_settings(**self._auto_upload_settings_from_config())
+
+    def choose_auto_excel_directory(self):
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择电量 Excel 监听文件夹", self.auto_excel_directory_input.text().strip()
+        )
+        if directory:
+            self.auto_excel_directory_input.setText(directory)
+
+    def choose_auto_image_directory(self):
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择几何量图片监听文件夹", self.auto_image_directory_input.text().strip()
+        )
+        if directory:
+            self.auto_image_directory_input.setText(directory)
+
+    def save_auto_upload_settings(self):
+        """保存目录配置并立即更新后台监听器。"""
+        excel_directory = self.auto_excel_directory_input.text().strip()
+        image_directory = self.auto_image_directory_input.text().strip()
+        enabled = self.auto_upload_enabled_checkbox.isChecked()
+        for label, directory in (("电量 Excel", excel_directory), ("几何量图片", image_directory)):
+            if directory and not Path(directory).is_dir():
+                QMessageBox.warning(self, "目录不可用", f"{label}监听文件夹不存在或不可访问：\n{directory}")
+                return
+        if enabled and not (excel_directory or image_directory):
+            QMessageBox.warning(self, "缺少目录", "请至少配置一个监听文件夹后再启用自动监听。")
+            return
+        lower_config.set("auto_upload", "enabled", str(enabled).lower())
+        lower_config.set("auto_upload", "excel_directory", excel_directory)
+        lower_config.set("auto_upload", "image_directory", image_directory)
+        self._sync_auto_upload_runtime()
+        self.log("自动文件夹上传设置已保存")
+        self.statusBar().showMessage("自动监听设置已保存", 4000)
+
+    @pyqtSlot(str)
+    def on_auto_upload_status_changed(self, status: str):
+        self.auto_upload_status_label.setText(status)
+        self.auto_upload_status_label.setStyleSheet(
+            "color: #267a3b;" if "自动监听" in status and "异常" not in status and "不可用" not in status else "color: #b15b00;"
+        )
+
+    def _auto_upload_status_display(self, status: str) -> tuple[str, str, bool]:
+        """把本地自动任务状态映射为数据列表可读文案和颜色。"""
+        status_map = {
+            "等待上传": ("已加入自动上传队列", "#1a73e8", False),
+            "上传中": ("自动上传中...", "#1a73e8", False),
+            "上传成功": ("✓ 自动上传成功", "#188038", True),
+            "等待重试": ("等待自动重试", "#c5221f", False),
+            "文件不存在": ("源文件不存在", "#c5221f", False),
+        }
+        return status_map.get(status, (status or "自动任务状态未知", "#555555", False))
+
+    def sync_auto_upload_data_list(self):
+        """从 SQLite 回放自动上传记录，保证已有任务也能显示在数据上传列表。"""
+        try:
+            records = self.upload_history_store.list_auto_recent()
+            for record in records:
+                path = Path(record.get("file_path") or "")
+                if not path:
+                    continue
+                item_key = str(path.resolve())
+                try:
+                    data_type = DataType(record.get("data_type"))
+                except (TypeError, ValueError):
+                    continue
+                display_status, color, uploaded = self._auto_upload_status_display(record.get("status", ""))
+                item_info = self.auto_data_items.get(item_key)
+                if item_info is None:
+                    # 历史文件即使被移动或删除，也使用数据库内的大小与名称展示其自动任务状态。
+                    meter_data = MeterData(
+                        data_type=data_type,
+                        file_path=path,
+                        timestamp=datetime.now(),
+                        description=f"自动上传 - {record.get('file_name') or path.stem}",
+                        file_size=int(record.get("file_size") or 0),
+                    )
+                    list_item = QListWidgetItem(self.data_list_widget)
+                    data_widget = MeterDataListItem(meter_data, upload_source="自动上传")
+                    list_item.setSizeHint(data_widget.sizeHint())
+                    self.data_list_widget.addItem(list_item)
+                    self.data_list_widget.setItemWidget(list_item, data_widget)
+                    item_info = {"item": list_item, "widget": data_widget, "data": meter_data}
+                    self.auto_data_items[item_key] = item_info
+                data_widget = item_info["widget"]
+                data_widget.set_status(display_status, color)
+                data_widget.set_progress(100 if uploaded else 0)
+                if uploaded:
+                    data_widget.set_uploaded(True)
+        except Exception as exc:
+            logger.exception(f"同步自动上传数据列表失败: {exc}")
+            self.log(f"自动上传列表同步失败: {exc}", error=True)
+
+    @pyqtSlot(str, str)
+    def on_auto_file_discovered(self, file_path: str, data_type: str):
+        """监听线程发现文件后，从已提交的 SQLite 记录同步对应自动任务行。"""
+        self.sync_auto_upload_data_list()
+        type_text = "电量 Excel" if data_type == DataType.EXCEL.value else "几何量图片"
+        self.log(f"[自动上传] 已加入待上传队列: {type_text} - {Path(file_path).name}")
+
+    @pyqtSlot(str)
+    def on_auto_upload_started(self, file_path: str):
+        """自动上传开始时同步数据库状态，避免状态停留在排队中。"""
+        self.sync_auto_upload_data_list()
+
+    @pyqtSlot(dict)
+    def on_auto_upload_result(self, result: dict):
+        """自动上传结束后回放最新 SQLite 状态，覆盖信号丢失或重启场景。"""
+        self.sync_auto_upload_data_list()
+        file_name = result.get("file_name", "未知文件")
+        if result.get("success"):
+            self.log(f"[自动上传] ✓ {file_name}: {result.get('message', '上传成功')}")
+        else:
+            self.log(f"[自动上传] ✗ {file_name}: {result.get('message', '上传失败')}，已等待重试", error=True)
+
+    @pyqtSlot(int)
+    def on_main_tab_changed(self, tab_index: int):
+        """切换上传页时先显示遮罩，再异步加载目标页内容。"""
+        self.tab_switch_loading_token += 1
+        token = self.tab_switch_loading_token
+        page_text = "上传记录" if tab_index == 1 else "数据上传"
+        self.show_loading(f"正在切换到{page_text}...")
+        QTimer.singleShot(0, lambda: self._finish_main_tab_switch(token, tab_index))
+
+    def _finish_main_tab_switch(self, token: int, tab_index: int):
+        """只完成最后一次标签页切换，避免快速点击留下过期遮罩。"""
+        if token != self.tab_switch_loading_token:
+            return
+        try:
+            if tab_index == 1:
+                self.refresh_upload_history()
+        finally:
+            self.hide_loading()
+
+    def eventFilter(self, watched, event):
+        """记录表滚动或键盘浏览期间不重绘，保持滚动流畅。"""
+        if hasattr(self, "upload_history_table") and watched in (
+            self.upload_history_table,
+            self.upload_history_table.viewport(),
+        ):
+            if event.type() in (
+                QEvent.Type.Wheel,
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.KeyPress,
+            ):
+                self.pause_upload_history_refresh()
+        return super().eventFilter(watched, event)
+
+    def pause_upload_history_refresh(self):
+        """延后记录表刷新，给用户的滚动与选中操作让出主线程。"""
+        if self.main_tabs.currentIndex() != 1:
+            return
+        self.upload_history_interacting = True
+        self.upload_history_interaction_timer.start(800)
+
+    def defer_upload_history_refresh(self):
+        """拖动滚动条结束后短暂等待，随后再合并刷新一次。"""
+        if self.main_tabs.currentIndex() == 1:
+            self.upload_history_interaction_timer.start(250)
+
+    def _resume_upload_history_refresh(self):
+        """用户停止操作后恢复刷新；积压变化只刷新一次。"""
+        self.upload_history_interacting = False
+        if self.upload_history_dirty:
+            self.schedule_upload_history_refresh()
+
+    def schedule_upload_history_refresh(self):
+        """合并后台上传的连续状态变化，避免自动上传时频繁重绘历史表。"""
+        self.upload_history_dirty = True
+        if (
+            self.main_tabs.currentIndex() != 1
+            or self.upload_history_interacting
+            or self.upload_history_refresh_scheduled
+        ):
+            return
+        self.upload_history_refresh_scheduled = True
+        QTimer.singleShot(500, self.refresh_upload_history)
+
+    def refresh_upload_history(self):
+        """仅在记录页可见且用户未滚动时批量刷新本地 SQLite 历史。"""
+        self.upload_history_refresh_scheduled = False
+        if not hasattr(self, "upload_history_table"):
+            return
+        if self.main_tabs.currentIndex() != 1 or self.upload_history_interacting:
+            self.upload_history_dirty = True
+            return
+        try:
+            records = self.upload_history_store.list_recent()
+            self.upload_history_table.setUpdatesEnabled(False)
+            self.upload_history_table.blockSignals(True)
+            self.upload_history_table.setRowCount(len(records))
+            self.upload_history_row_ids = []
+            for row_index, record in enumerate(records):
+                self.upload_history_row_ids.append(record["id"])
+                data_type_text = "电量数据" if record["data_type"] == DataType.EXCEL.value else "几何量数据"
+                values = [
+                    record.get("updated_at") or record.get("created_at") or "",
+                    record.get("source", ""),
+                    data_type_text,
+                    record.get("file_name", ""),
+                    record.get("status", ""),
+                    str(record.get("retry_count", 0)),
+                    record.get("server_file_id") or "-",
+                    record.get("file_path", ""),
+                    record.get("message") or "",
+                ]
+                for column, value in enumerate(values):
+                    self.upload_history_table.setItem(row_index, column, QTableWidgetItem(str(value)))
+                status_item = self.upload_history_table.item(row_index, 4)
+                if record.get("status") == "上传成功":
+                    status_item.setForeground(QColor("#188038"))
+                elif record.get("status") in ("等待重试", "上传失败", "文件不存在"):
+                    status_item.setForeground(QColor("#c5221f"))
+            self.upload_history_summary_label.setText(f"本地上传记录：{len(records)} 条，按最新时间排序")
+            self.upload_history_dirty = False
+        except Exception as exc:
+            logger.exception(f"刷新上传历史失败: {exc}")
+            self.upload_history_summary_label.setText(f"读取上传记录失败：{exc}")
+        finally:
+            self.upload_history_table.blockSignals(False)
+            self.upload_history_table.setUpdatesEnabled(True)
+    def delete_selected_upload_history_records(self):
+        """多选删除仅影响本地 SQLite 记录，不影响源文件和服务器数据。"""
+        selected_rows = sorted({index.row() for index in self.upload_history_table.selectedIndexes()})
+        record_ids = [self.upload_history_row_ids[row] for row in selected_rows if row < len(self.upload_history_row_ids)]
+        if not record_ids:
+            QMessageBox.information(self, "提示", "请先选择要删除的上传记录。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定删除选中的 {len(record_ids)} 条本地上传记录吗？\n不会删除源文件或服务器数据。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        deleted_count = self.upload_history_store.delete_records(record_ids)
+        self.log(f"已删除 {deleted_count} 条本地上传记录")
+        self.refresh_upload_history()
+
+    def show_upload_history_detail(self, row: int, _column: int):
+        values = []
+        headers = [self.upload_history_table.horizontalHeaderItem(index).text() for index in range(self.upload_history_table.columnCount())]
+        for column, header in enumerate(headers):
+            item = self.upload_history_table.item(row, column)
+            values.append(f"{header}: {item.text() if item else ''}")
+        QMessageBox.information(self, "上传记录详情", "\n".join(values))
     def show_loading(self, text: str = "处理中..."):
         """显示统一 loading 遮罩，避免按钮点击后没有反馈。"""
         if self.loading_overlay is None:
@@ -580,6 +982,11 @@ class LowerComputerWindow(QMainWindow):
         self.device_id_input.setText(lower_config.device_id)
         self.device_name_input.setText(lower_config.device_name)
         self.location_input.setText(lower_config.location)
+        self.auto_excel_directory_input.setText(lower_config.get("auto_upload", "excel_directory", ""))
+        self.auto_image_directory_input.setText(lower_config.get("auto_upload", "image_directory", ""))
+        self.auto_upload_enabled_checkbox.setChecked(
+            lower_config.get("auto_upload", "enabled", "false").lower() == "true"
+        )
         self.registration_status_label.setText("未查询")
         self.registration_detail_label.setText("请先提交注册申请")
 
@@ -813,6 +1220,7 @@ class LowerComputerWindow(QMainWindow):
             lower_config.device_id = self.device_id_input.text().strip()
             lower_config.device_name = self.device_name_input.text().strip()
             lower_config.location = self.location_input.text().strip()
+            self._sync_auto_upload_runtime()
             self.log("配置已保存到 lower_config.ini")
             QMessageBox.information(self, "成功", "配置已保存！")
         except Exception as e:
@@ -926,6 +1334,7 @@ class LowerComputerWindow(QMainWindow):
         def on_success(payload):
             self.client = APIClient(payload["server_url"])
             self.authenticated = True
+            self._sync_auto_upload_runtime()
             self._apply_registration_status(payload["registration_result"])
             self.log(f"连接成功: {payload['auth_result'].get('message')}")
             self._stop_registration_status_polling()
@@ -958,6 +1367,7 @@ class LowerComputerWindow(QMainWindow):
 
         def on_error(message):
             self.authenticated = False
+            self._sync_auto_upload_runtime()
             self.log(f"连接失败: {message}", error=True)
             self.statusBar().showMessage("连接失败 ✗")
             self.query_registration_status(silent=True, show_dialog=False)
@@ -1030,7 +1440,7 @@ class LowerComputerWindow(QMainWindow):
 
         # 创建列表项
         item = QListWidgetItem(self.data_list_widget)
-        data_widget = MeterDataListItem(meter_data)
+        data_widget = MeterDataListItem(meter_data, upload_source="手动上传")
 
         item.setSizeHint(data_widget.sizeHint())
         self.data_list_widget.addItem(item)
@@ -1080,11 +1490,11 @@ class LowerComputerWindow(QMainWindow):
 
     def clear_data_list(self):
         """清空数据列表"""
-        if self.data_items:
+        if self.data_items or self.auto_data_items:
             reply = QMessageBox.question(
                 self,
                 "确认",
-                f"确定要清空所有 {len(self.data_items)} 个数据吗？",
+                f"确定要清空所有 {len(self.data_items) + len(self.auto_data_items)} 个数据吗？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
 
@@ -1093,6 +1503,7 @@ class LowerComputerWindow(QMainWindow):
                 try:
                     self.data_list_widget.clear()
                     self.data_items.clear()
+                    self.auto_data_items.clear()
                     self.update_data_count()
                     self.log("已清空数据列表")
                 finally:
@@ -1260,6 +1671,13 @@ class LowerComputerWindow(QMainWindow):
                     file_info['widget'].set_status("✗ 失败", "red")
                     file_info['widget'].set_progress(0)
                     self.log(f"✗ {file_name}: {message}", error=True)
+                self.upload_history_store.record_manual_result(
+                    file_info['data'].file_path,
+                    file_info['data'].data_type,
+                    success,
+                    message,
+                )
+                self.refresh_upload_history()
                 break
 
         # 检查是否全部完成
@@ -1371,14 +1789,26 @@ class LowerComputerWindow(QMainWindow):
                 event.ignore()
                 return
 
-        # 关闭连接
-        
-        if self.long_polling_thread:
-            self.log("正在停止HTTP心跳...")
-            self.long_polling_thread.stop()
-            self.long_polling_thread.join(timeout=3)
+        # 确认退出后立即遮罩界面，防止用户在各后台线程收尾时继续操作。
+        self.show_loading("正在安全退出，请稍候...")
+        try:
+            # 停止自动监听线程，避免程序关闭后继续访问目录或服务器。
+            if self.auto_upload_thread:
+                self.update_loading_text("正在停止自动文件上传监听...")
+                self.auto_upload_thread.stop()
+                self.auto_upload_thread.wait(3000)
 
-        self.thread_pool.waitForDone(3000)
+            # 关闭连接
+            if self.long_polling_thread:
+                self.update_loading_text("正在关闭服务器连接...")
+                self.log("正在停止HTTP心跳...")
+                self.long_polling_thread.stop()
+                self.long_polling_thread.join(timeout=3)
+
+            self.update_loading_text("正在结束手动上传任务...")
+            self.thread_pool.waitForDone(3000)
+        finally:
+            self.hide_loading()
         event.accept()
     
     def on_connected(self):
@@ -1389,6 +1819,7 @@ class LowerComputerWindow(QMainWindow):
     def on_disconnected(self):
         """断开连接回调"""
         self.authenticated = False
+        self._sync_auto_upload_runtime()
         self.add_excel_btn.setEnabled(False)
         self.add_image_btn.setEnabled(False)
         self.upload_btn.setEnabled(False)
@@ -1398,6 +1829,7 @@ class LowerComputerWindow(QMainWindow):
     def on_error(self, error: str):
         """错误回调"""
         self.authenticated = False
+        self._sync_auto_upload_runtime()
         self.add_excel_btn.setEnabled(False)
         self.add_image_btn.setEnabled(False)
         self.upload_btn.setEnabled(False)
@@ -1407,6 +1839,7 @@ class LowerComputerWindow(QMainWindow):
     def on_registration_pending(self):
         """长轮询发现当前设备未审批时，自动刷新注册进度。"""
         self.authenticated = False
+        self._sync_auto_upload_runtime()
         self.add_excel_btn.setEnabled(False)
         self.add_image_btn.setEnabled(False)
         self.upload_btn.setEnabled(False)

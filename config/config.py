@@ -63,6 +63,15 @@ class LowerConfig:
             'max_retries': '3',
             'concurrent_uploads': '2'
         }
+        self.config['auto_upload'] = {
+            # 自动监听只扫描目录第一层，文件稳定两次扫描后才入队上传。
+            'enabled': 'false',
+            'excel_directory': '',
+            'image_directory': '',
+            'scan_interval_seconds': '3',
+            # 服务器异常时单次网络请求快速返回，后续由本地队列退避重试。
+            'request_timeout_seconds': '10'
+        }
 
         self.config['path'] = {
             'last_excel_dir': '',
