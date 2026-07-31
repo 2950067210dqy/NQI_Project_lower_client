@@ -426,7 +426,7 @@ class LowerComputerWindow(QMainWindow):
         toolbar.addWidget(image_frame)
 
         # 自动文件夹上传配置：监听和网络请求都在后台线程，不阻塞 PyQt 主界面。
-        auto_upload_group = QGroupBox("自动文件夹上传")
+        auto_upload_group = QGroupBox("测试数据自动上传")
         auto_upload_layout = QVBoxLayout()
         auto_upload_head = QHBoxLayout()
         self.auto_upload_enabled_checkbox = QCheckBox("启用自动监听")
